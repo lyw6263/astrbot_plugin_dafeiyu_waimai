@@ -21,6 +21,13 @@
 | 榜单 | 每晚 21:00 自动播当日收入榜，前三名有奖牌 |
 | 限量单 | 每天 3 张全群抢，30–60 元，手快有手慢无 |
 
+<p align="center">
+  <img src="docs/shots/dispatch.png" width="47%" alt="派单卡：一次派三张，挑一张跑">
+  <img src="docs/shots/leaderboard.png" width="47%" alt="结算卡与每晚九点的收入榜">
+</p>
+
+<p align="center"><sub>示意图：卡片上的文字、数字、emoji 全部由插件自己的渲染函数输出（<code>core/render.py</code>），这里只是外面套了一层群聊窗框。</sub></p>
+
 ---
 
 ## 三十秒上手

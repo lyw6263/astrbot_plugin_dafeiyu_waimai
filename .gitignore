@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 存档（含真实玩家数据，别提交）
+data/waimai.db
+data/waimai.db-*
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/temp/
+data/cmd_config.json
+
+# 本地探针与配置
+local/
+*.log
+*.tmp
+
+# 打包产物
+dist/
+build/
+*.zip
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

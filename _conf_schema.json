@@ -1,0 +1,38 @@
+﻿{
+  "enabled": {
+    "description": "启用这个玩法",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉之后 #接单 这些指令不再响应；存档都还在，随时能开回来"
+  },
+  "groups_only": {
+    "description": "只允许在群里玩",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后私聊发 #接单 不响应。排行榜本来就是按群分开的，私聊跑单等于自己跟自己排"
+  },
+  "broadcast_time": {
+    "description": "每天几点播今日收入榜",
+    "type": "string",
+    "default": "21:00",
+    "hint": "填 HH:MM，用服务器本地时间。播过的群当天不会重复播；顺手会报明天的天气"
+  },
+  "night_broadcast": {
+    "description": "要不要定时播榜单",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉就只在有人发 #收入榜 时才算，不主动刷屏"
+  },
+  "live_ai": {
+    "description": "每单现编剧情（调大肥鱼背后的模型）",
+    "type": "bool",
+    "default": true,
+    "hint": "开着时每送一单会实时问模型要一段剧情；关掉就只用素材池里的句子"
+  },
+  "live_timeout": {
+    "description": "现编等多久算超时（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "超时就用素材池兜底，群里照常出结果。模型慢就把这个调大，别超过 12"
+  }
+}

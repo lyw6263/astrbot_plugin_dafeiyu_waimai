@@ -1,0 +1,5 @@
+# 源码统一 LF，避免 Windows 检出后 CRLF 混进 diff
+* text=auto eol=lf
+*.pdf binary
+*.png binary
+*.jpg binary

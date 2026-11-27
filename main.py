@@ -25,7 +25,7 @@ from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from .core import game, render
+from .core import art, cards, game, render
 from .core.game import (
     DAY_ORDER_CAP, GEARS, LEVELS, MEAL_PER_DAY, MEAL_PRICE, MEAL_STAMINA,
     STAMINA_MAX, VEHICLES, Order, Player, day_key, is_peak,
@@ -89,7 +89,7 @@ def _parse_hhmm(text: str) -> tuple[int, int, bool]:
     "astrbot_plugin_dafeiyu_waimai",
     "dsh",
     "风里雨里 · 外卖骑手：群里接单送单，攒钱换车",
-    "v0.12.0",
+    "v0.13.0",
 )
 class WaimaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -243,27 +243,36 @@ class WaimaiPlugin(Star):
                 pass
         return event.plain_result(text)
 
-    async def _to_image(self, text: str, umo: str) -> Image | None:
-        """把卡片渲染成图片；没配文转图服务或渲染失败就返回 None（退回纯文字）。"""
-        if not self.image_cards or not text:
+    async def _to_image(self, spec: dict, umo: str) -> Image | None:
+        """把卡片描述画成图片；画不出来就返回 None（退回纯文字）。
+
+        用的是插件自己的 Pillow 画板（core/art.py），不走 AstrBot 的
+        Markdown 文转图 —— 那玩意儿出来的是「加了行号的纯文字」。
+        """
+        if not self.image_cards or not spec:
             return None
         try:
-            path = await self.text_to_image(text, return_url=False, umo=umo)
-        except Exception as e:
-            logger.warning(f"[waimai] 卡片渲染成图失败，改发文字：{type(e).__name__}: {e}")
-            return None
-        if not path:
+            # 画一张 900×1500 的图要一两百毫秒，扔到线程里，别卡住别的群
+            img = await asyncio.to_thread(art.render_card, spec)
+            path = await asyncio.to_thread(art.save_card, img)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[waimai] 卡片画图失败，改发文字：{type(e).__name__}: {e}")
             return None
         try:
-            p = str(path)
-            return Image(file=p) if p.startswith(("http://", "https://")) else Image.fromFileSystem(p)
-        except Exception as e:
+            return Image.fromFileSystem(path)
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"[waimai] 图片组件创建失败，改发文字：{type(e).__name__}: {e}")
             return None
 
-    async def _card(self, event: AstrMessageEvent, text: str):
-        """长卡片（派单/结算/商店/榜单/帮助…）优先发成图，渲染不出来退回文字。"""
-        image = await self._to_image(text, event.unified_msg_origin)
+    async def _card(self, event: AstrMessageEvent, spec: dict, text: str = ""):
+        """长卡片（派单/结算/商店/榜单/帮助…）优先发成图，画不出来退回文字。"""
+        image = await self._to_image(spec, event.unified_msg_origin)
+        return self._reply(event, text, image=image)
+
+    async def _say(self, event: AstrMessageEvent, text: str):
+        """一句普通的群内回话，也做成一张小卡片 —— 群里只发图，不再刷文字。"""
+        spec = cards.message_spec(text)
+        image = await self._to_image(spec, event.unified_msg_origin)
         return self._reply(event, text, image=image)
 
     async def _player(self, event: AstrMessageEvent) -> Player:
@@ -376,7 +385,7 @@ class WaimaiPlugin(Star):
             # 但每条都提示也吵，所以同一个人的提示 5 秒内只发一次。
             if now - self._cool_warn.get(key, 0) > 5:
                 self._cool_warn[key] = now
-                yield self._reply(event, "⏱ 慢一点，一秒钟只认一条指令。")
+                yield await self._say(event, "⏱ 慢一点，一秒钟只认一条指令。")
             return
         self._last_cmd[key] = now
         if len(self._last_cmd) > 512:      # 群里人多，字典别无限长
@@ -394,13 +403,13 @@ class WaimaiPlugin(Star):
                 yield out
         except Exception as e:            # 出错也要说话，别让群友以为死了
             logger.exception("[waimai] 指令出错")
-            yield self._reply(event, f"🛵 系统抽风了（{type(e).__name__}），这单不算，再试一次？")
+            yield await self._say(event, f"🛵 系统抽风了（{type(e).__name__}），这单不算，再试一次？")
 
     async def _dispatch(self, verb: str, arg: str, event: AstrMessageEvent):
         umo = event.unified_msg_origin
 
         if verb in ("帮助",):
-            yield await self._card(event, render.help_card())
+            yield await self._card(event, cards.help_spec(), render.help_card())
 
         elif verb in ("接单", "派单"):
             async for r in self._dispatch_orders(umo, event):
@@ -416,24 +425,28 @@ class WaimaiPlugin(Star):
 
         elif verb in ("我的", "状态", "钱包"):
             p = await self._player(event)
-            yield await self._card(event, render.status_card(p, self._weather(umo), is_peak(time.time())))
+            yield await self._card(event, cards.status_spec(p, self._weather(umo), is_peak(time.time())),
+                                  render.status_card(p, self._weather(umo), is_peak(time.time())))
 
         elif verb in ("收入榜", "排行榜", "榜单"):
             day = self._day()
             rows = await self.store.leaderboard(umo, 10, day)
-            yield await self._card(event, render.leaderboard_card(day, rows))
+            yield await self._card(event, cards.leaderboard_spec(day, rows),
+                              render.leaderboard_card(day, rows))
 
         elif verb == "周榜":
             rows = await self.store.leaderboard(umo, 10, by="week")
-            yield await self._card(event, render.leaderboard_card(self._day(), rows, by="week"))
+            yield await self._card(event, cards.leaderboard_spec(self._day(), rows, by="week"),
+                              render.leaderboard_card(self._day(), rows, by="week"))
 
         elif verb == "总榜":
             rows = await self.store.leaderboard(umo, 10, by="total")
-            yield await self._card(event, render.leaderboard_card(self._day(), rows, by="total"))
+            yield await self._card(event, cards.leaderboard_spec(self._day(), rows, by="total"),
+                              render.leaderboard_card(self._day(), rows, by="total"))
 
         elif verb == "任务":
             p = await self._player(event)
-            yield await self._card(event, render.tasks_card(p))
+            yield await self._card(event, cards.tasks_spec(p), render.tasks_card(p))
 
         elif verb in ("押", "押注"):
             async for r in self._bet(umo, arg, event):
@@ -454,7 +467,7 @@ class WaimaiPlugin(Star):
         elif verb == "商店":
             p = await self._player(event)
             page = "gear" if ("装备" in (arg or "") or "gear" in (arg or "").lower()) else "car"
-            yield await self._card(event, render.shop_card(p, page))
+            yield await self._card(event, cards.shop_spec(p, page), render.shop_card(p, page))
 
         elif verb == "买":
             async for r in self._buy(umo, arg, event):
@@ -482,27 +495,27 @@ class WaimaiPlugin(Star):
 
     async def _narrator_probe(self, event: AstrMessageEvent):
         """#叙事池：既看一眼现状，也当场试补一池，把失败原因显式打出来。"""
-        yield self._reply(event, self._narrator_card())
+        yield await self._say(event, self._narrator_card())
         try:
             prov = await self._provider(event)
         except Exception as e:
-            yield self._reply(event, f"⚠️ 取对话模型报错：{type(e).__name__}: {e}")
+            yield await self._say(event, f"⚠️ 取对话模型报错：{type(e).__name__}: {e}")
             return
         if prov is None:
-            yield self._reply(event, "⚠️ 这个会话没绑定对话模型（provider=None），文案只能用内置兜底。")
+            yield await self._say(event, "⚠️ 这个会话没绑定对话模型（provider=None），文案只能用内置兜底。")
             return
         sizes = self.narrator.sizes()
         kind = min(self.narrator.KINDS, key=lambda k: sizes.get(k, 0))
         cfg = getattr(prov, "provider_config", None) or {}
         model = cfg.get("model", "") if isinstance(cfg, dict) else ""
-        yield self._reply(event, f"⏳ 正在向模型要一池「{kind}」…（模型 {model or '未知'}）")
+        yield await self._say(event, f"⏳ 正在向模型要一池「{kind}」…（模型 {model or '未知'}）")
         await self.narrator._refill(prov, kind)
         after = self.narrator.sizes()
         got = after.get(kind, 0) - sizes.get(kind, 0)
         if got > 0:
-            yield self._reply(event, f"✅ 「{kind}」补进了 {got} 条，现在共 {after.get(kind, 0)} 条。")
+            yield await self._say(event, f"✅ 「{kind}」补进了 {got} 条，现在共 {after.get(kind, 0)} 条。")
         else:
-            yield self._reply(event, 
+            yield await self._say(event, 
                 f"❌ 「{kind}」没补上：{self.narrator.last_error or '模型返回空'}\n"
                 "（这条报错原文会写进日志，抄给我就能定位）")
 
@@ -535,10 +548,10 @@ class WaimaiPlugin(Star):
         now = time.time()
         bad = game.can_take_orders(p)
         if bad:
-            yield self._reply(event, f"🚫 {bad}")
+            yield await self._say(event, f"🚫 {bad}")
             return
         if p.pending and now - p.pending_at < PENDING_TTL:
-            yield self._reply(event, 
+            yield await self._say(event, 
                 f"手上还有 {len(p.pending)} 张单没挑（{int(PENDING_TTL - (now - p.pending_at))} 秒后作废）。"
                 "先 #接 1 或者 #跳过。")
             return
@@ -554,7 +567,8 @@ class WaimaiPlugin(Star):
         p.pending = [o.to_dict() for o in orders]
         p.pending_at = now
         await self.store.save_player(umo, p)
-        yield await self._card(event, render.dispatch_card(p, orders, weather, peak, alert))
+        yield await self._card(event, cards.dispatch_spec(p, orders, weather, peak, alert),
+                              render.dispatch_card(p, orders, weather, peak, alert))
         await self._refill_narrator(event)
 
     async def _take(self, umo: str, arg: str, event: AstrMessageEvent):
@@ -562,19 +576,19 @@ class WaimaiPlugin(Star):
         now = time.time()
         idx = _num(arg)
         if not p.pending:
-            yield self._reply(event, "还没派单呢，先发 #接单。")
+            yield await self._say(event, "还没派单呢，先发 #接单。")
             return
         if now - p.pending_at > PENDING_TTL:
             p.pending = []
             await self.store.save_player(umo, p)
-            yield self._reply(event, "⏳ 这几张单太久没人接，被别的骑手抢走了。再 #接单 看看。")
+            yield await self._say(event, "⏳ 这几张单太久没人接，被别的骑手抢走了。再 #接单 看看。")
             return
         if idx is None or not (1 <= idx <= len(p.pending)):
-            yield self._reply(event, f"要接哪张？回 #接 1 / #接 2 / #接 3。")
+            yield await self._say(event, f"要接哪张？回 #接 1 / #接 2 / #接 3。")
             return
         bad = game.can_take_orders(p)
         if bad:
-            yield self._reply(event, f"🚫 {bad}")
+            yield await self._say(event, f"🚫 {bad}")
             return
         order = Order.from_dict(p.pending[idx - 1])
         p.pending = []
@@ -599,19 +613,19 @@ class WaimaiPlugin(Star):
             logger.exception("[waimai] 结算卡渲染失败")
             card = (f"🛵 这单结算完成（{st.income:+d} 元），卡片没渲染出来，"
                     f"💰 余额 {int(p.money)} 元。")
-        yield await self._card(event, card)
+        yield await self._card(event, cards.settle_spec(p, st, weather, peak, story=story), card)
         await self._refill_narrator(event)
 
     async def _skip(self, umo: str, event: AstrMessageEvent):
         p = await self._player(event)
         if not p.pending:
-            yield self._reply(event, "本来就没单，直接 #接单 吧。")
+            yield await self._say(event, "本来就没单，直接 #接单 吧。")
             return
         p.pending = []
         p.pending_at = 0.0
         p.stamina = max(0.0, p.stamina - SKIP_STAMINA)
         await self.store.save_player(umo, p)
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"🔄 这批不接了，掉头回商圈等下一批（⚡ 体力 −{SKIP_STAMINA} → {int(p.stamina)}）。再 #接单。")
 
     # ------------------------------------------------------------ 限量单
@@ -647,21 +661,22 @@ class WaimaiPlugin(Star):
         p = await self._player(event)
         bad = game.can_take_orders(p)
         if bad:
-            yield self._reply(event, f"🚫 {bad}")
+            yield await self._say(event, f"🚫 {bad}")
             return
         slots = await self.store.ensure_limited(umo, self._day(), self._limited_orders(umo, self._day()))
-        yield await self._card(event, render.limited_card(slots, self._weather(umo), p))
+        yield await self._card(event, cards.limited_spec(slots, self._weather(umo), p),
+                              render.limited_card(slots, self._weather(umo), p))
 
     async def _grab(self, umo: str, arg: str, event: AstrMessageEvent):
         p = await self._player(event)
         now = time.time()
         idx = _num(arg)
         if idx is None or idx not in (1, 2, 3):
-            yield self._reply(event, "要抢哪一单？先 #抢单 看看，再回 #抢 3。")
+            yield await self._say(event, "要抢哪一单？先 #抢单 看看，再回 #抢 3。")
             return
         bad = game.can_take_orders(p)
         if bad:
-            yield self._reply(event, f"🚫 {bad}")
+            yield await self._say(event, f"🚫 {bad}")
             return
         day = self._day()
         order = await self.store.get_limited_order(umo, day, idx)
@@ -669,15 +684,15 @@ class WaimaiPlugin(Star):
             await self.store.ensure_limited(umo, day, self._limited_orders(umo, day))
             order = await self.store.get_limited_order(umo, day, idx)
         if order is None:
-            yield self._reply(event, "今天没有这一单，发 #抢单 看看。")
+            yield await self._say(event, "今天没有这一单，发 #抢单 看看。")
             return
         if order.km > vehicle_of(p)["max_km"]:
-            yield self._reply(event, 
+            yield await self._say(event, 
                 f"🚫 这单 {order.km}km，{vehicle_of(p)['name']} 跑不了这么远，换张近的。")
             return
         ok = await self.store.claim_limited(umo, day, idx, p.uid, p.name)
         if not ok:
-            yield self._reply(event, "💨 手慢了，这单已经被别的骑手抢走了。")
+            yield await self._say(event, "💨 手慢了，这单已经被别的骑手抢走了。")
             return
         # 抢来的单宽限：钻石段位给 2 分钟，新手机再给 2 分钟（两样都有就是 4 分钟）
         if p.level >= 3:
@@ -702,7 +717,7 @@ class WaimaiPlugin(Star):
             # 结算炸了就把名额还回去，别让这单变成「已被抢走」永远消失
             await self.store.release_limited(umo, day, idx)
             raise
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"⚡ {p.name} 抢到了！\n"
             + render.settle_card(p, st, weather, peak, story=story))
         await self._refill_narrator(event)
@@ -713,17 +728,17 @@ class WaimaiPlugin(Star):
         p = await self._player(event)
         idx = _num(arg)
         if idx is None:
-            yield self._reply(event, "买几号？先 #商店 看清编号，再 #买 3。")
+            yield await self._say(event, "买几号？先 #商店 看清编号，再 #买 3。")
             return
         n_veh = len(VEHICLES)
         if 1 <= idx <= n_veh:
             vi = idx - 1
             veh = VEHICLES[vi]
             if vi <= p.vehicle:
-                yield self._reply(event, f"你已经比 {veh['name']} 强了，不用买。")
+                yield await self._say(event, f"你已经比 {veh['name']} 强了，不用买。")
                 return
             if p.money < veh["price"]:
-                yield self._reply(event, 
+                yield await self._say(event, 
                     f"💰 {veh['name']} 要 {veh['price']} 元，你还差 "
                     f"{veh['price'] - int(p.money)} 元。先跑几单。")
                 return
@@ -733,44 +748,44 @@ class WaimaiPlugin(Star):
             p.sick = 0
             p.pending = []          # 换车了，手上那批按旧车速算的单作废
             await self.store.save_player(umo, p)
-            yield self._reply(event, 
+            yield await self._say(event, 
                 f"{veh['emoji']} 换车了！{veh['name']}（{veh['speed']}km/h，能跑 {veh['max_km']}km）。"
                 f"💰 余额 {int(p.money)} 元。\n🚦 {veh['desc']}\n"
                 f"🛠 新车，车况 {int(game.DURABILITY_MAX)}/{int(game.DURABILITY_MAX)}。")
             return
         gi = idx - n_veh - 1
         if not (0 <= gi < len(GEARS)):
-            yield self._reply(event, "没有这个编号，发 #商店 看看。")
+            yield await self._say(event, "没有这个编号，发 #商店 看看。")
             return
         g = GEARS[gi]
         if g["id"] in p.gear:
-            yield self._reply(event, f"你已经买了 {g['emoji']} {g['name']}。")
+            yield await self._say(event, f"你已经买了 {g['emoji']} {g['name']}。")
             return
         if p.money < g["price"]:
-            yield self._reply(event, f"💰 还差 {g['price'] - int(p.money)} 元。")
+            yield await self._say(event, f"💰 还差 {g['price'] - int(p.money)} 元。")
             return
         p.money -= g["price"]
         p.gear.append(g["id"])
         await self.store.save_player(umo, p)
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"{g['emoji']} 买了 {g['name']}（{g['desc']}）。💰 余额 {int(p.money)} 元。")
 
     async def _eat(self, umo: str, event: AstrMessageEvent):
         p = await self._player(event)
         if p.today_meals >= MEAL_PER_DAY:
-            yield self._reply(event, f"🍚 今天已经吃了 {MEAL_PER_DAY} 顿，再吃跑不动了。")
+            yield await self._say(event, f"🍚 今天已经吃了 {MEAL_PER_DAY} 顿，再吃跑不动了。")
             return
         if p.money < MEAL_PRICE:
-            yield self._reply(event, f"💰 饭钱 {MEAL_PRICE} 元都不够…先跑一单。")
+            yield await self._say(event, f"💰 饭钱 {MEAL_PRICE} 元都不够…先跑一单。")
             return
         if p.stamina >= STAMINA_MAX - 1:
-            yield self._reply(event, "你现在体力满的，别浪费钱。")
+            yield await self._say(event, "你现在体力满的，别浪费钱。")
             return
         p.money -= MEAL_PRICE
         p.today_meals += 1
         p.stamina = min(float(STAMINA_MAX), p.stamina + MEAL_STAMINA)
         await self.store.save_player(umo, p)
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"🍚 蹲在路边扒了口饭（−{MEAL_PRICE} 元），⚡ 体力回到 {int(p.stamina)}/{STAMINA_MAX}。"
             f"今天还能吃 {MEAL_PER_DAY - p.today_meals} 次。")
 
@@ -779,11 +794,11 @@ class WaimaiPlugin(Star):
         dur, top = p.durability, int(game.DURABILITY_MAX)
         # 什么车况都能修：小毛病就几块钱，烂得厉害才贵；满格又没爆胎才劝退
         if dur >= game.DURABILITY_MAX - 0.05 and not p.sick:
-            yield self._reply(event, f"🔧 车况 {dur:.0f}/{top}，好好的，不用花这钱。")
+            yield await self._say(event, f"🔧 车况 {dur:.0f}/{top}，好好的，不用花这钱。")
             return
         price = game.repair_price(p)
         if p.money < price:
-            yield self._reply(event, f"💰 修车要 {price} 元（车况 {dur:.0f}/{top}），"
+            yield await self._say(event, f"💰 修车要 {price} 元（车况 {dur:.0f}/{top}），"
                                      f"你只有 {int(p.money)} 元。先跑两单？")
             return
         p.money -= price
@@ -792,14 +807,14 @@ class WaimaiPlugin(Star):
         p.sick = 0
         await self.store.save_player(umo, p)
         tail = f"，刚才剩下的 {left} 单也不用带病跑了" if left else ""
-        yield self._reply(event, f"🔧 修好了（−{price} 元）：车况 {dur:.0f} → {top}/{top}{tail}。")
+        yield await self._say(event, f"🔧 修好了（−{price} 元）：车况 {dur:.0f} → {top}/{top}{tail}。")
 
     async def _checkin(self, umo: str, event: AstrMessageEvent):
         p = await self._player(event)
         before = p.stamina
         res = game.checkin(p, time.time())
         if not res["ok"]:
-            yield self._reply(event, f"📅 今天已经签过了（连签 {res['streak']} 天），"
+            yield await self._say(event, f"📅 今天已经签过了（连签 {res['streak']} 天），"
                                      f"明天再来还接着算。")
             return
         await self.store.save_player(umo, p)
@@ -808,7 +823,7 @@ class WaimaiPlugin(Star):
         # 体力本来就满的时候不该写「+15」，写实际加了多少
         gain = int(round(p.stamina - before))
         stam = f"体力 +{gain}" if gain > 0 else "体力本来就满"
-        yield self._reply(event, f"📅 签到成功 ｜ 连签 {streak} 天 ｜ +{res['money']} 元 ｜ "
+        yield await self._say(event, f"📅 签到成功 ｜ 连签 {streak} 天 ｜ +{res['money']} 元 ｜ "
                                  f"{stam}{hot}\n"
                                  f"💰 余额 {int(p.money)} 元 ｜ 体力 "
                                  f"{int(p.stamina)}/{game.STAMINA_MAX}")
@@ -816,15 +831,15 @@ class WaimaiPlugin(Star):
     async def _shortcut(self, umo: str, event: AstrMessageEvent):
         p = await self._player(event)
         if p.level < 1:
-            yield self._reply(event, "抄近道是白银骑手才有的本事，先跑出 900 元周收入。")
+            yield await self._say(event, "抄近道是白银骑手才有的本事，先跑出 900 元周收入。")
             return
         if p.shortcut_day == self._day():
-            yield self._reply(event, "今天已经抄过一次近道了，明天再来。")
+            yield await self._say(event, "今天已经抄过一次近道了，明天再来。")
             return
         p.shortcut_day = self._day()
         p.shortcut_armed = True
         await self.store.save_player(umo, p)
-        yield self._reply(event, "🗺 把这片小区的后门都摸熟了，下一单不容易超时。")
+        yield await self._say(event, "🗺 把这片小区的后门都摸熟了，下一单不容易超时。")
 
     # ------------------------------------------------------------ 押注 / 打赏
 
@@ -851,34 +866,34 @@ class WaimaiPlugin(Star):
         raw = (arg or "").strip()
         if not raw:
             rows = await self.store.open_bets(umo, day)
-            yield await self._card(event, render.bets_card(rows, day))
+            yield await self._card(event, cards.bets_spec(rows, day), render.bets_card(rows, day))
             return
         m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", raw)
         if not m:
-            yield self._reply(event, "押注这样写：#押 小王 100（名字 + 金额）")
+            yield await self._say(event, "押注这样写：#押 小王 100（名字 + 金额）")
             return
         name, stake = m.group(1), int(m.group(2))
         if stake < 10:
-            yield self._reply(event, "押多少都行，但至少 10 元。")
+            yield await self._say(event, "押多少都行，但至少 10 元。")
             return
         target = await self._find_player(umo, name)
         if target is None:
-            yield self._reply(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
+            yield await self._say(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
             return
         if target.uid == p.uid:
-            yield self._reply(event, "押自己没意思——你的单得自己跑。")
+            yield await self._say(event, "押自己没意思——你的单得自己跑。")
             return
         if p.money < stake:
-            yield self._reply(event, f"💰 你手上只有 {int(p.money)} 元，押不起 {stake} 元。")
+            yield await self._say(event, f"💰 你手上只有 {int(p.money)} 元，押不起 {stake} 元。")
             return
         if not await self.store.place_bet(umo, day, p.uid, p.name,
                                           target.uid, target.name, stake):
-            yield self._reply(event, "🎟 今天已经押过了，一人一天一注，等晚上开奖。")
+            yield await self._say(event, "🎟 今天已经押过了，一人一天一注，等晚上开奖。")
             return
         p.money = float(round(p.money - stake))
         await self.store.save_player(umo, p)
         rows = await self.store.open_bets(umo, day)
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"🎟 {p.name} 押 {target.name} 进今日前三，{stake} 元已进池。\n"
             f"晚上九点开奖：押中平台赔你一倍，{target.name} 进前三还有彩头。\n\n"
             + render.bets_card(rows, day))
@@ -888,27 +903,27 @@ class WaimaiPlugin(Star):
         raw = (arg or "").strip()
         m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", raw)
         if not m:
-            yield self._reply(event, "打赏这样写：#打赏 小王 50（名字 + 金额）")
+            yield await self._say(event, "打赏这样写：#打赏 小王 50（名字 + 金额）")
             return
         name, amount = m.group(1), int(m.group(2))
         if amount < 1:
-            yield self._reply(event, "打赏金额得是正数。")
+            yield await self._say(event, "打赏金额得是正数。")
             return
         target = await self._find_player(umo, name)
         if target is None:
-            yield self._reply(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
+            yield await self._say(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
             return
         if target.uid == p.uid:
-            yield self._reply(event, "自己给自己打赏，平台不收这种手续费。")
+            yield await self._say(event, "自己给自己打赏，平台不收这种手续费。")
             return
         if p.money < amount:
-            yield self._reply(event, f"💰 你手上只有 {int(p.money)} 元，打赏不起 {amount} 元。")
+            yield await self._say(event, f"💰 你手上只有 {int(p.money)} 元，打赏不起 {amount} 元。")
             return
         p.money = float(round(p.money - amount))
         target.money = float(round(target.money + amount))
         await self.store.save_player(umo, p)
         await self.store.save_player(umo, target)
-        yield self._reply(event, 
+        yield await self._say(event, 
             f"💝 {p.name} 给 {target.name} 打赏了 {amount} 元（不进今日榜，纯心意）。\n"
             f"{target.name} 现在有 {int(target.money)} 元。")
 
@@ -975,17 +990,24 @@ class WaimaiPlugin(Star):
                     await self.store.release_night(umo, day)
                     continue
                 text = render.leaderboard_card(day, rows)
+                spec = cards.leaderboard_spec(day, rows)
                 # 押注开奖：晚上播榜的时候一起算，押的人当晚就知道结果
                 bets = await self._settle_bets(umo, day)
+                extra: list[str] = list(bets)
                 if bets:
                     text += "\n\n" + "\n".join(bets)
                 tomorrow = roll_weather(f"{umo}:{day_key(time.time() + 86400)}")
                 w = game.WEATHERS.get(tomorrow) or game.WEATHERS["sunny"]
-                text += f"\n\n明天 {w['emoji']} {w['name']}天"
+                tail = f"明天 {w['emoji']} {w['name']}天"
                 if w["bonus"]:
-                    text += f"，补贴 +{int(w['bonus'] * 100)}%"
-                text += "。收车吧，明早接着跑。"
-                image = await self._to_image(text, umo)
+                    tail += f"，补贴 +{int(w['bonus'] * 100)}%"
+                tail += "。收车吧，明早接着跑。"
+                text += "\n\n" + tail
+                extra.append(tail)
+                spec.setdefault("blocks", []).append(
+                    {"kind": "note", "tone": "good" if bets else "info", "text": "\n".join(extra)}
+                )
+                image = await self._to_image(spec, umo)
                 chain = [image] if image is not None else [Plain(text)]
                 await self.context.send_message(umo, MessageChain(chain))
                 sent = True

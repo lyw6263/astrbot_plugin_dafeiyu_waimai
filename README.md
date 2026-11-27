@@ -21,14 +21,19 @@
 | 榜单 | 今日榜、周榜、职业生涯总榜；每晚 21:00 自动播当日榜，前三名有奖牌 |
 | 限量单 | 每天 3 张全群抢，30–60 元，手快有手慢无 |
 | 群互动 | 每天三条小任务自动发钱；`#押 名字 金额` 押谁能进前三，晚上九点开奖；`#打赏` 直接把钱塞给群友 |
-| 卡片 | 派单、结算、商店、榜单、帮助都渲染成图片发出去（AstrBot 自带文转图），群里一屏看完；渲染不出来自动退回文字 |
+| 卡片 | **所有回话都是插件自己画的卡片**（Pillow 绘制，不是文字转图）：深色底、圆角面板、彩色 emoji、进度条；长短自适应，短回话也是卡片。画不出来自动退回纯文字 |
 
 <p align="center">
-  <img src="docs/shots/dispatch.png" width="47%" alt="派单卡：一次派三张，挑一张跑">
-  <img src="docs/shots/leaderboard.png" width="47%" alt="结算卡与每晚九点的收入榜">
+  <img src="docs/shots/card-dispatch.png" width="62%" alt="派单卡：一次派三张，挑一张跑">
 </p>
 
-<p align="center"><sub>示意图：卡片上的文字、数字、emoji 全部由插件自己的渲染函数输出（<code>core/render.py</code>），这里只是外面套了一层群聊窗框。</sub></p>
+<p align="center">
+  <img src="docs/shots/card-tasks.png" width="31%" alt="今日任务">
+  <img src="docs/shots/card-board.png" width="31%" alt="今日收入榜">
+  <img src="docs/shots/card-checkin.png" width="31%" alt="签到回话也长这样">
+</p>
+
+<p align="center"><sub>上面是插件真实输出的卡片（<code>core/art.py</code> 现场绘制，Pillow 画的，没经过任何文字转图服务）。写进群聊时外面只有一层聊天气泡。</sub></p>
 
 ---
 
@@ -145,7 +150,7 @@ pip install -r requirements.txt
 | `night_broadcast` | bool | `true` | 关掉后不主动刷屏，只在有人发 `#收入榜` 时才算 |
 | `live_ai` | bool | `true` | 每单现编剧情。关掉只用素材池里的句子，零延迟 |
 | `live_timeout` | int | `10` | 现编等多久算超时（秒），超时用素材池兜底，建议不超过 12 |
-| `image_cards` | bool | `true` | 把派单、结算、商店、榜单、帮助这些长卡片渲染成图片发出去（用 AstrBot 自带的文转图）；渲染失败自动退回纯文字 |
+| `image_cards` | bool | `true` | 所有回话都由插件自己画成卡片图（`core/art.py`）；关掉退回 `core/render.py` 的纯文字。画图失败也会自动退回文字 |
 
 ---
 
@@ -358,7 +363,9 @@ python tools/simulate.py --days 60 --orders 30
 main.py              # AstrBot 命令层：解析、派单、结算、定时任务
 core/game.py         # 纯数值内核：车辆/装备/段位/天气/派单/结算，无 IO
 core/store.py        # SQLite 存档（aiosqlite）
-core/render.py       # 卡片排版（纯文本 + emoji）
+core/render.py       # 纯文字排版（image_cards 关掉、或画图失败时用）
+core/art.py          # 画图引擎：配色、字体、彩色 emoji、折行、各类面板块
+core/cards.py        # 把游戏状态拼成卡片「图纸」（每张卡一个 *_spec）
 core/narrator.py     # 素材池与 LLM 现编剧情
 data/narrator.json   # 素材池种子
 tools/simulate.py    # 经济模拟器

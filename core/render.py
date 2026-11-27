@@ -9,10 +9,10 @@ from .game import (
 )
 
 BUCKET_TEXT = {
-    "premium": "优质（评分 ≥4.8，好单多）",
+    "premium": "优质 · 评分 ≥4.8，好单多",
     "good": "良好",
     "normal": "一般",
-    "floor": "保底（评分 <4.0，只能接保底单）",
+    "floor": "保底 · 评分 <4.0，只能接保底单",
 }
 
 BAD_LABEL = {"late": "迟到", "pack": "洒凉", "damage": "磕碰", "karen": "碰瓷"}
@@ -23,8 +23,20 @@ def yuan(v) -> str:
     return ("+" if v > 0 else ("−" if v < 0 else "")) + str(abs(v))
 
 
+def _round1(v: float) -> str:
+    """耐久 0.4 这种小数值别显示成 0（看着像已经跑不动的车还在跑）。"""
+    v = float(v)
+    if v <= 0:
+        return "0"
+    if v >= 1:
+        return f"{v:.0f}"
+    return f"{v:.1f}"
+
+
 def stamina_bar(v: float) -> str:
-    n = max(0, min(10, int(round(v / STAMINA_MAX * 10))))
+    # int(x+0.5) 是四舍五入；round() 是银行家舍入，恰好在 5/15/25… 这些常见值上
+    # 会往下取，体力条看着「漏一格」。
+    n = max(0, min(10, int(max(0.0, v) / STAMINA_MAX * 10 + 0.5)))
     return "▰" * n + "▱" * (10 - n)
 
 
@@ -101,9 +113,12 @@ def settle_card(p: Player, st: Settlement, weather: str, peak: bool,
     if st.tip:
         detail.append(f"小费 +{st.tip}")
     if st.cost:
-        detail.append(f"损耗 −{st.cost}")
+        detail.append(f"损耗 −{_round1(st.cost)}")
     if st.bonus:
-        detail.append(f"补贴 {'+' if st.bonus > 0 else ''}{st.bonus}")
+        # 恶意投诉是 bonus -= 10：写「补贴 -10」会让人以为平台倒扣补贴，
+        # 其实是赔给顾客的钱。
+        detail.append(f"赔偿 −{abs(st.bonus)}" if st.bonus < 0
+                      else f"补贴 +{st.bonus}")
     if st.fine:
         detail.append(f"罚款 −{st.fine}")
     lines.append(f"💸 {yuan(st.income)} 元（{'，'.join(detail)}）")
@@ -111,8 +126,9 @@ def settle_card(p: Player, st: Settlement, weather: str, peak: bool,
     if st.bad_review:
         why = BAD_LABEL.get(st.bad_kind, "")
         why = f"（{why}）" if why else ""
+        # 一天能挨 5、6 个差评，但上限是 4，显示 5/4 只会让人以为卡了
         lines.append(f"💢 差评 +{st.bad_review}{why}"
-                     f"（今日 {st.today_bad}/4，满 4 个扣当日收入 15%）")
+                     f"（今日 {min(st.today_bad, 4)}/4，满 4 个扣当日收入 15%）")
     if p.rating > st.rating_before:
         lines.append(f"⭐ 评分 {st.rating_before:.2f} → {st.rating_after:.2f}")
     elif p.rating < st.rating_before:
@@ -152,7 +168,7 @@ def settle_card(p: Player, st: Settlement, weather: str, peak: bool,
         dur_note = "　🛑 跑不动了，先 #修车"
     elif st.durability_after < DURABILITY_WARN:
         dur_note = "　⚠️ 车况见底"
-    lines.append(f"🛠 车损 −{st.wear}（耐久 {st.durability_after:.0f}/{int(DURABILITY_MAX)}）"
+    lines.append(f"🛠 车损 −{st.wear}（耐久 {_round1(st.durability_after)}/{int(DURABILITY_MAX)}）"
                  f"{dur_note}")
     lines.append(f"⚡ 体力 {int(st.stamina_after)}/{STAMINA_MAX} {stamina_bar(st.stamina_after)}")
     lines.append(f"💰 余额 {int(st.money_after)} 元 ｜ 今日 {st.today_orders} 单 "
@@ -193,7 +209,7 @@ def status_card(p: Player, weather: str, peak: bool) -> str:
         f"⭐ 评分 {p.rating:.2f}（{BUCKET_TEXT[rating_bucket(p)]}） ｜ 累计 {p.orders} 单",
         f"💰 余额 {int(p.money)} 元 ｜ 今日 {p.today_orders} 单 {yuan(p.today_income)} 元",
         f"⚡ 体力 {int(p.stamina)}/{STAMINA_MAX} {stamina_bar(p.stamina)} ｜ "
-        f"差评 {p.today_bad}/4 ｜ 今日上限 {DAY_ORDER_CAP} 单",
+        f"差评 {min(p.today_bad, 4)}/4 ｜ 今日上限 {DAY_ORDER_CAP} 单",
         weather_text(weather, peak),
     ]
     nxt = next_level_need(p)
@@ -233,33 +249,39 @@ def status_card(p: Player, weather: str, peak: bool) -> str:
         tail += f" ｜ 🛞 带病上路剩 {p.sick} 单"
     # 什么车况都能修，所以价钱一直挂着；车况好的时候就是个几块钱的小修
     tail += f" ｜ #修车 {repair_price(p)} 元"
-    lines.append(f"🛠 车况 {dur:.0f}/{int(DURABILITY_MAX)} {stamina_bar(dur)}{tail}")
+    lines.append(f"🛠 车况 {_round1(dur)}/{int(DURABILITY_MAX)} {stamina_bar(dur)}{tail}")
     lines.append(f"📅 连签 {p.checkin_streak} 天 ｜ #签到 领钱（连签越久给越多）")
     return "\n".join(lines)
 
 
-def shop_card(p: Player) -> str:
+def shop_card(p: Player, page: str = "car") -> str:
+    """补给站。车和装备分两页发 —— 20 行一次发出去在手机上要翻两屏半，
+    发下来没人看得到底部的「#买 编号」怎么用。
+    """
     v = vehicle_of(p)
-    lines = [f"🏪 补给站 ｜ 当前 {v['emoji']} {v['name']} ｜ 💰 {int(p.money)} 元", ""]
-    idx = 0
-    lines.append("【车】")
-    for i, veh in enumerate(VEHICLES):
-        idx += 1
-        if i == p.vehicle:
-            lines.append(f"  {idx}. {veh['emoji']} {veh['name']}（当前）—")
-        elif i < p.vehicle:
-            lines.append(f"  {idx}. {veh['emoji']} {veh['name']} — 已拥有")
+    left = max(0, MEAL_PER_DAY - p.today_meals)
+    if page == "gear":
+        lines = [f"🏪 补给站 · 装备 ｜ 💰 {int(p.money)} 元", "", "【装备】"]
+        for i, g in enumerate(GEARS, start=len(VEHICLES) + 1):
+            if g["id"] in p.gear:
+                lines.append(f"  {i}. {g['emoji']} {g['name']} — 已拥有")
+            else:
+                lines.append(f"  {i}. {g['emoji']} {g['name']} {g['price']} 元 ｜ {g['desc']}")
+        lines.append("")
+        lines.append(f"#买 编号 下单 ｜ #商店 回车 ｜ 今天还能 #吃饭 {left} 次")
+        return "\n".join(lines)
+
+    lines = [f"🏪 补给站 · 车 ｜ 当前 {v['emoji']} {v['name']} ｜ 💰 {int(p.money)} 元", "", "【车】"]
+    for i, veh in enumerate(VEHICLES, start=1):
+        if i - 1 == p.vehicle:
+            lines.append(f"  {i}. {veh['emoji']} {veh['name']}（当前）—")
+        elif i - 1 < p.vehicle:
+            lines.append(f"  {i}. {veh['emoji']} {veh['name']} — 已拥有")
         else:
-            lines.append(f"  {idx}. {veh['emoji']} {veh['name']} {veh['price']} 元 ｜ {veh['desc']}")
-    lines.append("【装备】")
-    for g in GEARS:
-        idx += 1
-        if g["id"] in p.gear:
-            lines.append(f"  {idx}. {g['emoji']} {g['name']} — 已拥有")
-        else:
-            lines.append(f"  {idx}. {g['emoji']} {g['name']} {g['price']} 元 ｜ {g['desc']}")
+            lines.append(f"  {i}. {veh['emoji']} {veh['name']} {veh['price']} 元 ｜ {veh['desc']}")
     lines.append("")
-    lines.append(f"#买 编号 下单 ｜ 每天还能 #吃饭 {MEAL_PER_DAY} 次（{MEAL_PRICE} 元 +{MEAL_STAMINA} 体力）")
+    lines.append(f"#买 编号 下单 ｜ #商店 装备 看装备 ｜ 每天 {MEAL_PER_DAY} 次 #吃饭")
+    lines.append(f"今天还能 #吃饭 {left} 次（{MEAL_PRICE} 元 +{MEAL_STAMINA} 体力）")
     return "\n".join(lines)
 
 
@@ -283,7 +305,7 @@ def help_card() -> str:
         "",
         "#接单    派 3 张单，挑一张跑",
         "#接 1    接第 1 张（#接 2 / #接 3）",
-        "#跳过    这一批不要，等下一批",
+        "#跳过    这一批不要，等下一批（⚡ 体力 −2）",
         "#我的    看车、评分、体力、余额、段位",
         "#收入榜  今天的群内排名",
         "#抢单    限量单（30–60 元，全群先到先得）",
@@ -296,8 +318,8 @@ def help_card() -> str:
         "#抄近道  白银骑手每日 1 次，下一单格外顺、不容易超时",
         "#叙事池  看 AI 素材池补到多少条了（排障用）",
         "",
-        "规则：超时按分钟扣钱，迟到越久罚得越多（先扣一半配送费，每多迟到一分钟再加 2 元，",
-        "最多把这单的钱扣光，不倒欠）；配送失败（联系不上人 / 门禁进不去 / 餐洒了）",
+        "规则：超时按分钟扣钱，越拖越狠——先扣这一单配送费的 15%，每多迟到一分钟再加 5%，",
+        "最多把这单的钱扣光，不倒欠；配送失败（联系不上人 / 门禁进不去 / 餐洒了）",
         "配送费全没，还要赔餐费 8–25 元，评分掉得更狠。准时送到达成好评有小费；",
         "一天最多 30 单，体力每 6 分钟回 1 点——别硬撑，先 #吃饭。",
         "全群同一天气，天气会影响路上的顺不顺和补贴。",
@@ -312,12 +334,21 @@ def limited_card(slots: list[dict], weather: str, p: Player | None = None) -> st
     w = WEATHERS.get(weather, WEATHERS["sunny"])
     lines = [f"⚡ 今日限量单 ｜ {w['emoji']} {w['name']}天 ｜ 全群先到先得"]
     for s in slots:
-        o = s["order"]
-        if s["claimed_by"]:
-            lines.append(f"  ❌ 已被人抢走（{s['claimed_name']}）")
+        o = s.get("order") or {}
+        # 限量单的存档是一段 JSON：库里那条坏了的话 o 会是空 dict，
+        # 这里硬取键会把整条指令炸掉，什么都发不出去。
+        if not o.get("shop"):
+            lines.append(f"  ⚠️ {s.get('slot', '?')}. 这一单的存档读不出来，换一张吧")
             continue
-        lines.append(f"  🔥 {s['slot']}. {o['shop']} → {o['dest']} ｜ {o['km']}km ｜ "
-                     f"{o['pay']} 元 ｜ 限时 {o['limit']} 分")
+        if s.get("claimed_by"):
+            lines.append(f"  ❌ 已被人抢走（{s.get('claimed_name') or '别人'}）")
+            continue
+        lines.append(f"  🔥 {s.get('slot', '?')}. {o.get('shop')} → {o.get('dest', '?')} ｜ "
+                     f"{o.get('km', 0)}km ｜ {o.get('pay', 0)} 元 ｜ 限时 {o.get('limit', 0)} 分")
+        floor = o.get("floor")
+        if floor is not None:
+            lift = "有电梯" if o.get("elevator") else "无电梯"
+            lines.append(f"     {floor} 楼 {lift}")
         extra = []
         if o.get("item"):
             extra.append(f"{o.get('shop_emoji') or '🛍'} {o['item']}")
@@ -325,7 +356,7 @@ def limited_card(slots: list[dict], weather: str, p: Player | None = None) -> st
             extra.append(f"📝 {o['note']}")
         if extra:
             lines.append("     " + " ｜ ".join(extra))
-    if any(not s["claimed_by"] for s in slots):
+    if any(not s.get("claimed_by") for s in slots):
         lines.append("")
         lines.append("#抢 编号 抢（手快有手慢无）")
     return "\n".join(lines)

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import time
@@ -130,8 +131,8 @@ CHECKIN_STAMINA = 15
 
 WEATHERS = {
     "sunny": {"emoji": "☀️", "name": "晴",   "timeout": 0.0,  "bonus": 0.0},
-    "rain":  {"emoji": "🌧", "name": "雨",   "timeout": 0.10, "bonus": 0.5},
-    "snow":  {"emoji": "🌨", "name": "雪",   "timeout": 0.18, "bonus": 0.8},
+    "rain":  {"emoji": "🌧️", "name": "雨",   "timeout": 0.10, "bonus": 0.5},
+    "snow":  {"emoji": "🌨️", "name": "雪",   "timeout": 0.18, "bonus": 0.8},
 }
 
 SHOPS = [
@@ -173,22 +174,49 @@ DESTS = [
 
 # ---------------------------------------------------------------- 数据结构
 
+def _i(v, default: int = 0) -> int:
+    """宽容取整：None / 脏字符串 / 坏档一律回落默认值，绝不让存档把指令炸崩。"""
+    try:
+        if isinstance(v, bool) or v is None:
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _f(v, default: float = 0.0) -> float:
+    """宽容取浮点，同上。"""
+    try:
+        if isinstance(v, bool) or v is None:
+            return default
+        out = float(v)
+        return out if math.isfinite(out) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _deep_copy_pending(pending: list) -> list:
+    """pending 里是订单 dict，序列化时必须拷一份，
+    否则 to_dict 出来的对象和内存里的列表指着同一块，后面清空 pending 会一起改掉。"""
+    return [dict(x) for x in pending] if isinstance(pending, list) else []
+
+
 @dataclass
 class Player:
     uid: str
     name: str = "骑手"
-    money: int = START_MONEY
+    money: float = float(START_MONEY)
     rating: float = RATING_INIT
     stamina: float = float(STAMINA_MAX)
     stamina_at: float = 0.0
     vehicle: int = 0
     gear: list[str] = field(default_factory=list)
     orders: int = 0                       # 累计接单
-    week_income: int = 0
+    week_income: float = 0.0
     level: int = 0
     day: str = ""                         # 今日日期（YYYY-MM-DD）
     today_orders: int = 0
-    today_income: int = 0
+    today_income: float = 0.0
     today_bad: int = 0
     today_meals: int = 0
     today_penalty: bool = False           # 今日已吃「4 差评」罚金
@@ -205,63 +233,72 @@ class Player:
     checkin_streak: int = 0               # 连签天数
 
     # -- 序列化
+    # 钱一律按「整元」存档：结算时就 round 好，这里再 round 一次兜底。
+    # 千万别用 int() 截断 —— 截断会把每单的零头（三轮车 0.6 元油钱这种）静默吞掉，
+    # 玩家跑一天白丢十几块，而且负数还会向 0 截，罚款等于少扣。
     def to_dict(self) -> dict:
         return {
-            "uid": self.uid, "name": self.name, "money": int(self.money),
+            "uid": self.uid, "name": self.name, "money": int(round(self.money)),
             "rating": round(float(self.rating), 2), "stamina": round(float(self.stamina), 1),
             "stamina_at": float(self.stamina_at), "vehicle": int(self.vehicle),
             "veh_ver": VEHICLE_INDEX_VER,
             "gear": list(self.gear), "orders": int(self.orders),
-            "week_income": int(self.week_income), "level": int(self.level),
+            "week_income": int(round(self.week_income)), "level": int(self.level),
             "day": self.day, "today_orders": int(self.today_orders),
-            "today_income": int(self.today_income), "today_bad": int(self.today_bad),
+            "today_income": int(round(self.today_income)),
+            "today_bad": int(self.today_bad),
             "today_meals": int(self.today_meals), "today_penalty": bool(self.today_penalty),
             "sick": int(self.sick), "durability": round(float(self.durability), 1),
             "shortcut_day": self.shortcut_day, "shortcut_armed": bool(self.shortcut_armed),
             "on_time_streak": int(self.on_time_streak),
             "checkin_day": self.checkin_day, "checkin_streak": int(self.checkin_streak),
-            "pending": self.pending, "pending_at": float(self.pending_at),
+            "pending": _deep_copy_pending(self.pending), "pending_at": float(self.pending_at),
+            "last_cmd": float(self.last_cmd),
             "created": float(self.created),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Player":
+        if not isinstance(d, dict):
+            raise ValueError("存档不是 dict")
         p = cls(uid=str(d.get("uid", "")))
-        p.name = d.get("name") or "骑手"
-        p.money = int(d.get("money", 0))
-        p.rating = float(d.get("rating", RATING_INIT))
-        p.stamina = float(d.get("stamina", STAMINA_MAX))
-        p.stamina_at = float(d.get("stamina_at", 0) or 0)
-        p.vehicle = int(d.get("vehicle", 0))
+        p.name = str(d.get("name") or "骑手")
+        p.money = _f(d.get("money"), 0.0)
+        p.rating = _f(d.get("rating"), RATING_INIT)
+        p.stamina = _f(d.get("stamina"), STAMINA_MAX)
+        p.stamina_at = _f(d.get("stamina_at"), 0.0)
+        p.vehicle = _i(d.get("vehicle"), 0)
         # 旧存档的车辆索引按着老车表来的，插了新车要迁移，否则电车玩家会变三轮车。
         # 四台车时代（veh_ver 缺省=1）先升到六台车，再统一升到现在的十台车。
-        ver = int(d.get("veh_ver", 1))
+        ver = _i(d.get("veh_ver"), 1)
         if ver < 2:
             p.vehicle = VEHICLE_MIGRATION_V1.get(p.vehicle, 0)
         if ver < VEHICLE_INDEX_VER:
             p.vehicle = VEHICLE_MIGRATION.get(p.vehicle, 0)
         p.vehicle = max(0, min(p.vehicle, len(VEHICLES) - 1))
-        p.gear = list(d.get("gear") or [])
-        p.orders = int(d.get("orders", 0))
-        p.week_income = int(d.get("week_income", 0))
-        p.level = int(d.get("level", 0))
-        p.day = d.get("day") or ""
-        p.today_orders = int(d.get("today_orders", 0))
-        p.today_income = int(d.get("today_income", 0))
-        p.today_bad = int(d.get("today_bad", 0))
-        p.today_meals = int(d.get("today_meals", 0))
+        gear = d.get("gear")
+        p.gear = [str(g) for g in gear if isinstance(g, str)] if isinstance(gear, list) else []
+        p.orders = _i(d.get("orders"), 0)
+        p.week_income = _f(d.get("week_income"), 0.0)
+        p.level = _i(d.get("level"), 0)
+        p.day = str(d.get("day") or "")
+        p.today_orders = _i(d.get("today_orders"), 0)
+        p.today_income = _f(d.get("today_income"), 0.0)
+        p.today_bad = _i(d.get("today_bad"), 0)
+        p.today_meals = _i(d.get("today_meals"), 0)
         p.today_penalty = bool(d.get("today_penalty", False))
-        p.sick = int(d.get("sick", 0))
-        p.durability = max(0.0, min(DURABILITY_MAX,
-                                    float(d.get("durability", DURABILITY_MAX))))
-        p.shortcut_day = d.get("shortcut_day") or ""
+        p.sick = _i(d.get("sick"), 0)
+        p.durability = max(0.0, min(DURABILITY_MAX, _f(d.get("durability"), DURABILITY_MAX)))
+        p.shortcut_day = str(d.get("shortcut_day") or "")
         p.shortcut_armed = bool(d.get("shortcut_armed", False))
-        p.on_time_streak = int(d.get("on_time_streak", 0))
-        p.checkin_day = d.get("checkin_day") or ""
-        p.checkin_streak = int(d.get("checkin_streak", 0))
-        p.pending = list(d.get("pending") or [])
-        p.pending_at = float(d.get("pending_at", 0) or 0)
-        p.created = float(d.get("created", 0) or 0)
+        p.on_time_streak = _i(d.get("on_time_streak"), 0)
+        p.checkin_day = str(d.get("checkin_day") or "")
+        p.checkin_streak = _i(d.get("checkin_streak"), 0)
+        pending = d.get("pending")
+        p.pending = [x for x in pending if isinstance(x, dict)] if isinstance(pending, list) else []
+        p.pending_at = _f(d.get("pending_at"), 0.0)
+        p.last_cmd = _f(d.get("last_cmd"), 0.0)
+        p.created = _f(d.get("created"), 0.0)
         return p
 
 
@@ -284,17 +321,39 @@ class Order:
     bulk: bool = False       # 大件单（整箱水/煤气罐，三轮车专属福利）
     biz: str = ""            # 品类（餐饮/药房/超市/…；空=内置餐饮店）
     who: str = ""            # 收件人称呼（王先生/刘女士，由叙事池给出）
+    settled: bool = False    # 已经结算过了：防止同一单被结算两次刷钱
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in (
             "idx", "shop", "shop_emoji", "dest", "km", "floor", "elevator",
             "pay", "speed", "limit", "slow", "premium", "item", "note", "bulk",
-            "biz", "who")}
+            "biz", "who", "settled")}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Order":
-        known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in d.items() if k in known})
+        """老存档 / 手改过的 pending 可能缺字段，这里逐个兜底，不许 TypeError。"""
+        if not isinstance(d, dict):
+            raise ValueError("订单不是 dict")
+        return cls(
+            idx=_i(d.get("idx"), 1),
+            shop=str(d.get("shop") or "商家"),
+            shop_emoji=str(d.get("shop_emoji") or "🏪"),
+            dest=str(d.get("dest") or "小区"),
+            km=max(0.1, _f(d.get("km"), 1.0)),
+            floor=max(0, _i(d.get("floor"), 1)),
+            elevator=bool(d.get("elevator", True)),
+            pay=max(1, _i(d.get("pay"), 10)),
+            speed=max(1, _i(d.get("speed"), 20)),
+            limit=max(5, _i(d.get("limit"), 30)),
+            slow=bool(d.get("slow", False)),
+            premium=bool(d.get("premium", False)),
+            item=str(d.get("item") or ""),
+            note=str(d.get("note") or ""),
+            bulk=bool(d.get("bulk", False)),
+            biz=str(d.get("biz") or ""),
+            who=str(d.get("who") or ""),
+            settled=bool(d.get("settled", False)),
+        )
 
 
 @dataclass
@@ -314,12 +373,14 @@ class Settlement:
     rating_before: float = RATING_INIT
     rating_after: float = RATING_INIT
     stamina_after: float = STAMINA_MAX
-    money_after: int = 0
-    today_income: int = 0
+    money_after: float = 0.0
+    today_income: float = 0.0
     today_orders: int = 0
     today_bad: int = 0
     events: list[str] = field(default_factory=list)
     broke: bool = False          # 今日 4 差评罚金触发
+    day_penalty: int = 0         # 今日 4 差评罚掉的钱（单列，不计进本单 income）
+    unpaid: float = 0.0          # 余额不够、平台替你兜掉的罚款
     accident: bool = False
     failed: bool = False         # 配送失败：没送到，赔付餐费
     fail_reason: str = ""       # 为什么没送到（由叙事池给出，结算卡里播）
@@ -419,8 +480,14 @@ def day_key(now: float) -> str:
 
 
 def roll_weather(seed_key: str) -> str:
-    """全群同一天气：由 (群, 日期) 决定性生成，不需要存储。"""
-    rng = random.Random(hash(seed_key) & 0xFFFFFFFF)
+    """全群同一天气：由 (群, 日期) 决定性生成，不需要存储。
+
+    注意：绝对不能用 hash(str) 播种 —— Python 的字符串 hash 每个进程都加了随机盐，
+    同一群同一天重启一次就会换一种天气，今天的预报和晚上播报的补贴全对不上。
+    这里用 blake2b 摘要当种子，跨进程、跨机器都稳定。
+    """
+    digest = hashlib.blake2b(str(seed_key).encode("utf-8"), digest_size=8).digest()
+    rng = random.Random(int.from_bytes(digest, "big"))
     r = rng.random()
     if r < 0.62:
         return "sunny"
@@ -462,7 +529,9 @@ def roll_day(p: Player, now: float) -> bool:
                 p.rating = min(RATING_MAX, p.rating + 0.04)
             elif p.today_bad >= 4:
                 p.rating = max(RATING_MIN, p.rating - 0.02)
-        if p.rating < 4.2:                     # 站长兜底：不至于永远爬不起来
+        # 站长兜底：不至于永远爬不起来。差评很多的那天不许兜 —— 否则刚扣完
+        # 0.02 就又被加回来，差评等于白给。
+        if p.rating < 4.2 and p.today_bad < 4:
             p.rating = min(4.2, p.rating + 0.05)
     p.day = d
     p.today_orders = 0
@@ -489,7 +558,7 @@ def rating_bucket(p: Player) -> str:
 # ---------------------------------------------------------------- 派单
 
 def _timeout_probability(order: Order, p: Player, weather: str, peak: bool) -> float:
-    w = WEATHERS[weather]
+    w = WEATHERS.get(weather) or WEATHERS["sunny"]
     veh = vehicle_of(p)
     # 基准超时率：老手、中等距离、有电梯、天气好这一档，超时约 24%；
     # 再加上配送失败约 6%，一单「跑砸」的概率就在三成上下。
@@ -555,7 +624,7 @@ def _fail_probability(order: Order, p: Player, weather: str, peak: bool) -> floa
         prob += 0.02
     if order.floor >= 10 and not order.elevator:
         prob += 0.03
-    wt = WEATHERS[weather]["timeout"]
+    wt = (WEATHERS.get(weather) or WEATHERS["sunny"])["timeout"]
     if veh.get("weather_immune"):
         wt = 0.0
     elif wt > 0 and has_gear(p, "raincoat"):
@@ -723,14 +792,31 @@ def order_template(order: Order) -> str:
 
 # ---------------------------------------------------------------- 结算
 
+def _late_penalty(pay: int, late_min: float) -> int:
+    """超时罚金：迟到不满 1 分钟按「起手一成半」算，每多迟到整一分钟再加 5%，
+    最多把这一单的配送费扣光（不倒欠）。"""
+    over = max(0, int(late_min) - 1)
+    ratio = min(1.0, 0.15 + 0.05 * over)
+    return max(1, min(int(pay), int(round(pay * ratio))))
+
+
 def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
            rng: random.Random, shortcut: bool = False) -> Settlement:
-    """结算一单。会就地修改玩家状态（体力/余额/评分/今日统计）。"""
+    """结算一单。会就地修改玩家状态（体力/余额/评分/今日统计）。
+
+    同一单只能结算一次：order.settled 落成 True 后重复调用直接抛 ValueError，
+    由调用方兜住。否则「保存失败重试」「pending 重放」都能把同一单的钱再刷一遍。
+    """
+    if order.settled:
+        raise ValueError("这一单已经结算过了")
+    if weather not in WEATHERS:      # 存档里被写坏 / 以后加新天气，一律当晴天
+        weather = "sunny"
     veh = vehicle_of(p)
     w = WEATHERS[weather]
     prob = _timeout_probability(order, p, weather, peak)
     if shortcut:
         prob = max(0.02, prob - 0.15)
+    punctured = False                # 本单刚爆的胎：这一单不算在「带病 3 单」里
 
     forced_late = False
     if order.elevator and order.floor >= 8 and rng.random() < 0.05:
@@ -759,13 +845,10 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
         st.actual_min = round(order.limit + rng.uniform(1.5, 8.0), 1)
         st.late_min = round(st.actual_min - order.limit, 1)
         # 超时罚款跟现实一样按分钟算：越晚扣得越多，扣的是这一单的钱
-        # （起手扣一成半，每多迟到一分钟再加 5%，最多把这单的钱扣光，不倒欠）。
+        # （迟到不到 1 分钟起手扣一成半，每多迟到一分钟再加 5%，最多把这单的钱扣光）。
         # 按比例扣是为了让便宜的小单不至于一次超时就白跑一晚上。
-        over = max(1, int(round(st.late_min)))
-        ratio = min(1.0, 0.15 + 0.05 * over)
-        penalty = max(1, min(int(order.pay), int(round(order.pay * ratio))))
-        st.delivery_fee = -penalty
-        st.events.append(f"❌ 超时 {st.late_min:g} 分，罚 {penalty} 元")
+        st.delivery_fee = -_late_penalty(order.pay, st.late_min)
+        st.events.append(f"❌ 超时 {st.late_min:g} 分，罚 {-st.delivery_fee} 元")
         if rng.random() < 0.20:
             st.bad_review = 1
             st.bad_kind = "late"
@@ -792,7 +875,7 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
         # 好评（15%，只可能发生在准时单；已经挨了差评就别再夸，自相矛盾）
         if st.bad_review == 0 and rng.random() < 0.15:
             st.tip = rng.randint(2, 8)
-            st.events.append(f"⭐ 好评，顾客打赏 {st.tip} 元")
+            st.events.append("⭐ 好评，顾客挺满意")
             p.rating += 0.02
 
     # ---- 随机事件
@@ -809,7 +892,7 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
             st.events = [e for e in st.events if not e.startswith("⭐ 好评")]
     if st.bad_review == 0 and not st.failed and rng.random() < 0.10:
         st.bonus += 5
-        st.events.append("💰 顾客额外打赏 5 元")
+        st.events.append("💰 顾客又额外打赏了一笔")
     if not st.failed and rng.random() < 0.08:
         st.bonus += 6
         st.events.append("↪️ 顺路捎了一单，额外 +6 元")
@@ -825,9 +908,12 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
                 late = True
                 st.on_time = False
                 st.tip = 0
+                # 摔车了这单肯定是迟到：按跟超时一样的比例扣，别偷偷把整单配送费变成 −5
+                # （之前那版写完只扣 5 元，比正常超时罚得还少，等于摔一跤还能少赔）。
+                st.events = [e for e in st.events if not e.startswith("⭐ 好评")]
                 st.actual_min = round(order.limit + rng.uniform(3, 9), 1)
                 st.late_min = round(st.actual_min - order.limit, 1)
-                st.delivery_fee = -5
+                st.delivery_fee = -_late_penalty(order.pay, st.late_min)
                 st.bad_review = max(st.bad_review, 1)
                 st.bad_kind = st.bad_kind or "late"
                 p.rating -= 0.05
@@ -840,6 +926,7 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
             st.events.append(f"👮 {head}{tail}")
     if veh.get("puncture") and p.sick == 0 and rng.random() < 0.04:
         p.sick = SICK_ORDERS
+        punctured = True             # 这一单不算在「带病 3 单」里，别刚爆胎就少算一单
         st.events.append(f"🛠 爆胎了！接下来 {SICK_ORDERS} 单车况差、更容易超时，"
                          f"`#修车` 立刻修好")
 
@@ -854,38 +941,50 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
     if st.delivery_fee > 0 and w["bonus"] > 0:
         extra = int(round(st.delivery_fee * w["bonus"]))
         st.bonus += extra
-        st.events.append(f"{w['emoji']} {w['name']}天补贴 +{extra} 元")
+        st.events.append(f"{w['emoji']} {w['name']}天，平台发了笔天气补贴")
 
     st.cost = veh["cost"]
     if p.level >= 5:
         st.cost = 0                  # 王者：平台补贴车辆损耗
 
-    st.income = st.delivery_fee + st.tip + st.bonus - st.cost - st.fine - st.compensate
+    # 钱按整元结（round 不是 int 截断）：结算、存档、卡片显示三处必须同一个数，
+    # 否则「每单丢几毛」在几十单后会变成一张对不上的账。
+    st.income = int(round(st.delivery_fee + st.tip + st.bonus
+                          - st.cost - st.fine - st.compensate))
 
     # ---- 写回玩家
     if st.bad_review:
         p.today_bad += st.bad_review
-    p.money += st.income
-    if p.money < 0:
-        p.money = 0
+    # 余额不够赔的时候平台把余额托到 0，但「实际扣了多少」要照实记进今日/本周：
+    # 只截 p.money 会让负债凭空消失，还会让下面的 4 差评罚金因为负收入算成 0。
+    raw = p.money + st.income
+    if raw < 0:
+        st.unpaid = round(-raw, 2)
+        p.money = 0.0
+    else:
+        p.money = float(round(raw))
     burn = STAMINA_PER_ORDER - (1.0 if has_gear(p, "saddle") else 0.0)
     p.stamina = max(0.0, p.stamina - burn)
-    if p.sick > 0:
-        p.sick -= 1
+    if p.stamina_at <= 0:
+        p.stamina_at = now          # 第一次结算顺手把回体力的计时起点放好
+    if p.sick > 0 and not punctured:
+        p.sick -= 1                 # 刚爆胎那一单不算，别把「接下来 3 单」扣成 2 单
     p.orders += 1
     p.today_orders += 1
-    p.today_income += st.income
-    p.week_income += st.income
+    p.today_income = float(round(p.today_income + st.income, 2))
+    p.week_income = float(round(p.week_income + st.income, 2))
     p.rating = max(RATING_MIN, min(RATING_MAX, p.rating))
+    order.settled = True            # 同一单不许结算第二次
 
     # 今日 4 个差评 → 当日总收入 −15%（一次性）
     if p.today_bad >= 4 and not p.today_penalty:
         p.today_penalty = True
-        fine = int(round(max(0, p.today_income) * 0.15))
+        fine = int(round(max(0.0, p.today_income) * 0.15))
         if fine > 0:
-            p.money = max(0, p.money - fine)
-            p.today_income -= fine
+            p.money = max(0.0, p.money - fine)
+            p.today_income = round(p.today_income - fine, 2)
             st.broke = True
+            st.day_penalty = fine          # 单列出来给卡片看，不混进本单收入
             st.events.append(f"📉 今日差评满 4 个，扣当日收入 15%（−{fine} 元）")
 
     st.rating_after = round(p.rating, 2)

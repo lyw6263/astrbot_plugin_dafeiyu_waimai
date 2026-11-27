@@ -31,7 +31,7 @@ KINDS = ("shops", "names", "note", "note_goods", "bulk", "praise",
 SHOP_SEP = "|"
 
 # 池子低于这个数就补货；一次补多少；两次补货之间的最短间隔（秒）
-MIN_POOL = 6
+MIN_POOL = 12          # 6 条太容易在一晚上重复撞上同一句，抬到 12
 REFILL = 24
 COOLDOWN = 600
 # 失败别等满 COOLDOWN：模型偶尔抽风/超时，90 秒后应该允许再试一次
@@ -307,10 +307,16 @@ FALLBACK = {
 
 
 def _clean(s: str) -> str:
-    s = str(s).strip().strip("\"'“”「」")
+    s = str(s).strip()
     # 只剥「1. 」「- 」「• 」这类列表标记，别把「24 小时药房」的 24 也吃掉
     s = re.sub(r"^[\s\-*·•]*(?:\d+[.、)）]\s*)?", "", s)
     s = s.replace("\n", " ").strip()
+    # 模型吐不完整成 JSON 时会走「按行切」的兜底，那一行常常长这样： "我饿了",
+    # 或者 "我饿了"]。先把 JSON 的尾巴剥干净，再剥引号。
+    s = re.sub(r"[\]\}]\s*$", "", s).strip()
+    s = s.strip(",").strip()
+    s = s.strip().strip("\"'“”「」").strip()
+    s = s.strip(",").strip()
     return s[:48]
 
 
@@ -417,20 +423,30 @@ class Narrator:
                 data = json.load(f)
         except Exception:
             return
+        if not isinstance(data, dict):
+            return
         for k in KINDS:
-            got = data.get(k) or []
+            try:
+                got = data.get(k) or []
+            except Exception:
+                continue
             if isinstance(got, list):
                 self.pools[k] = [s for s in got if isinstance(s, str) and _ok(s, k)]
 
     def save(self) -> None:
+        # 临时文件名带上 pid：两个进程（重载时旧进程还没退干净）同时写，
+        # 用同一个 .tmp 会把对方的文件换走，丢池子。
+        tmp = f"{self.path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.pools, f, ensure_ascii=False, indent=1)
             os.replace(tmp, self.path)
         except Exception:
-            pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # ---------------------------------------------------------- 取用
     def pick(self, kind: str, rng: random.Random) -> str:
@@ -516,14 +532,13 @@ class Narrator:
         if failed:
             # 失败了就没有「路上顺利」这种话，原因直接给「为什么没送到」
             out["late"] = self._safe_pick("fail", food, rng)
-        if bad_kind:
+            # 而且顾客这时候说的是「算了」——不能先说「洒了/凉了」，那是送到了才有的抱怨
+            out["cust"] = self._safe_pick("fail_cust", food, rng)
+        elif bad_kind:
             out["cust"] = self._safe_pick(self.BAD_POOL.get(bad_kind, "bad_pack"),
                                           food, rng)
         elif praised:
             out["cust"] = self._safe_pick("praise", food, rng)
-        elif failed:
-            # 顾客已经知道送不到了，说的是「算了」而不是「快点」
-            out["cust"] = self._safe_pick("fail_cust", food, rng)
         elif not late and rng.random() < 0.30:
             # 超时的单不可能有人夸你准时，别自相矛盾
             out["cust"] = self._safe_pick("praise", food, rng)
@@ -613,10 +628,19 @@ class Narrator:
             return
         pool = self.pools.setdefault(kind, [])
         have = set(pool)
+        added = 0
         for s in got:
             if s not in have:
                 pool.append(s)
                 have.add(s)
+                added += 1
+        if added == 0:
+            # 全是池子里已经有的：模型在重复自己，别当成成功——否则会卡在
+            # 「凑不满 MIN_POOL 就每 10 分钟再问一次」的循环里（最坏 100 次/小时）。
+            self.last_error = f"{kind}: 返回 {len(got)} 条但全是重复"
+            self._log(f"[waimai] 叙事池补货无新增 {self.last_error}")
+            self._filling[kind] = time.time() - COOLDOWN + RETRY_AFTER * 4
+            return
         if len(pool) > MAX_POOL:
             del pool[: len(pool) - MAX_POOL]
         self.last_error = ""
@@ -624,7 +648,7 @@ class Narrator:
         self.last_got = len(got)
         self._used[kind] = 0
         self.save()
-        self._log(f"[waimai] 叙事池 +{len(got)} 条 → {kind}（共 {len(pool)}）")
+        self._log(f"[waimai] 叙事池 +{added} 条 → {kind}（共 {len(pool)}）")
 
     def cancel(self) -> None:
         if self._task is not None:
@@ -696,10 +720,20 @@ class Narrator:
             self.live_err = f"实时剧情解析不出（{len(text)} 字）"
             return None
         out = {"cust": "", "merchant": "", "late": "", "chat": ""}
-        merchant = _clean(data.get("merchant", ""))[:30]
-        road = _clean(data.get("road", ""))[:30]
-        review = _clean(data.get("review", ""))[:30]
-        chat = _clean(data.get("chat", ""))[:30]
+
+        def _live(s: str) -> str:
+            """实时剧情也要过一遍池子那套过滤：模型是会写脏话的，
+            池子路径在 _ok() 里挡住了，这条路径以前是直通群聊的。
+            """
+            s = _clean(s)
+            if any(w in s for w in _BAD_WORDS):
+                return ""
+            return s[:30]
+
+        merchant = _live(data.get("merchant", ""))
+        road = _live(data.get("road", ""))
+        review = _live(data.get("review", ""))
+        chat = _live(data.get("chat", ""))
         if not food:
             for k, v in (("m", merchant), ("r", road), ("v", review), ("c", chat)):
                 if v and any(w in v for w in self.FOOD_WORDS):

@@ -57,20 +57,38 @@ def _num(arg: str) -> int | None:
     a = (arg or "").strip()
     if not a:
         return None
-    m = re.search(r"[0-9]+", a)
+    # 只认正整数：`#接 -1` 以前会被 re.search 抓成 1，等于替人接了个单
+    m = re.search(r"(?<![0-9])-?[0-9]+", a)
     if m:
-        return int(m.group())
+        v = int(m.group())
+        return v if v > 0 else None
     for ch in a:
         if ch in _NUM:
             return _NUM[ch]
     return None
 
 
+def _parse_hhmm(text: str) -> tuple[int, int, bool]:
+    """播报时间。配错（25:00 / 21:70 / 空）以前会把 CronTrigger 抛错带崩 initialize，
+    整个插件加载失败——现在一律夹回合法范围并回落 21:00。
+    """
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*", str(text or ""))
+    if not m:
+        return 21, 0, False
+    hh, mm = int(m.group(1)), int(m.group(2))
+    ok = (0 <= hh <= 23) and (0 <= mm <= 59)
+    if not (0 <= hh <= 23):
+        hh = 21
+    if not (0 <= mm <= 59):
+        mm = 0
+    return hh, mm, ok
+
+
 @register(
     "astrbot_plugin_dafeiyu_waimai",
     "dsh",
     "风里雨里 · 外卖骑手：群里接单送单，攒钱换车",
-    "v0.10.0",
+    "v0.10.1",
 )
 class WaimaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -91,6 +109,9 @@ class WaimaiPlugin(Star):
         self.narrator = Narrator(str(self.data_dir / "narrator.json"))
         self._rng = random.Random()
         self._last_cmd: dict[str, float] = {}
+        self._cool_warn: dict[str, float] = {}
+        self._warm: asyncio.Task | None = None
+        self._catchup: asyncio.Task | None = None
         self._sched: AsyncIOScheduler | None = None
 
     # ------------------------------------------------------------ 生命周期
@@ -100,15 +121,15 @@ class WaimaiPlugin(Star):
         self.narrator.log = lambda msg: logger.info(msg)
         self.narrator.load()
         self._sched = AsyncIOScheduler()
-        hh, mm = 21, 0
-        try:
-            hh, mm = [int(x) for x in self.broadcast_time.split(":")[:2]]
-        except Exception:
-            pass
+        hh, mm, ok = _parse_hhmm(self.broadcast_time)
+        if not ok:
+            logger.warning(f"[waimai] broadcast_time={self.broadcast_time!r} 不合法，按 21:00 播报")
         self._sched.add_job(self._night, CronTrigger(hour=hh, minute=mm),
-                            id="waimai_night", replace_existing=True)
+                            id="waimai_night", replace_existing=True,
+                            coalesce=True, misfire_grace_time=3600)
         self._sched.add_job(self._weekly, CronTrigger(day_of_week="mon", hour=0, minute=10),
-                            id="waimai_weekly", replace_existing=True)
+                            id="waimai_weekly", replace_existing=True,
+                            coalesce=True, misfire_grace_time=3600 * 6)
         self._sched.start()
         logger.info(f"[waimai] 就绪：{hh:02d}:{mm:02d} 榜单播报，周一结算段位")
         # 启动后自己预热一遍素材池：不等人发 #接单，先把 AI 文案攒起来
@@ -116,6 +137,22 @@ class WaimaiPlugin(Star):
             self._warm = asyncio.create_task(self._warm_narrator())
         except Exception:
             self._warm = None
+        # 关机错过播报（笔记本合盖、重启）就补一次，靠 night 标记防重复
+        try:
+            self._catchup = asyncio.create_task(self._night_catchup(hh, mm))
+        except Exception:
+            self._catchup = None
+
+    async def _night_catchup(self, hh: int, mm: int) -> None:
+        """启动时间已经过了今晚的播报点，就补播一次；没到点、已经播过都不动。"""
+        await asyncio.sleep(20)
+        now = time.localtime()
+        if (now.tm_hour, now.tm_min) < (hh, mm):
+            return
+        try:
+            await self._night()
+        except Exception as e:
+            logger.warning(f"[waimai] 补播失败 {type(e).__name__}: {e}")
 
     async def _warm_narrator(self) -> None:
         await asyncio.sleep(8)
@@ -134,9 +171,16 @@ class WaimaiPlugin(Star):
 
     async def terminate(self) -> None:
         self.narrator.cancel()
-        warm = getattr(self, "_warm", None)
-        if warm is not None:
-            warm.cancel()
+        # 关插件时把还在跑的预热/补播任务收掉，否则重载会叠出两份
+        tasks = [t for t in (self._warm, self._catchup) if t is not None]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
+        self._warm = self._catchup = None
         if self._sched:
             try:
                 self._sched.shutdown(wait=False)
@@ -285,8 +329,21 @@ class WaimaiPlugin(Star):
         now = time.time()
         if now - self._last_cmd.get(key, 0) < COOLDOWN:
             event.stop_event()
+            # 以前这里静默 return：手快的人发两条，第二条没反应，以为插件死了。
+            # 但每条都提示也吵，所以同一个人的提示 5 秒内只发一次。
+            if now - self._cool_warn.get(key, 0) > 5:
+                self._cool_warn[key] = now
+                yield self._reply(event, "⏱ 慢一点，一秒钟只认一条指令。")
             return
         self._last_cmd[key] = now
+        if len(self._last_cmd) > 512:      # 群里人多，字典别无限长
+            for k, t in list(self._last_cmd.items()):
+                if now - t > 120:
+                    self._last_cmd.pop(k, None)
+        if len(self._cool_warn) > 256:
+            for k, t in list(self._cool_warn.items()):
+                if now - t > 60:
+                    self._cool_warn.pop(k, None)
 
         event.stop_event()
         try:
@@ -319,8 +376,9 @@ class WaimaiPlugin(Star):
             yield self._reply(event, render.status_card(p, self._weather(umo), is_peak(time.time())))
 
         elif verb in ("收入榜", "排行榜", "榜单"):
-            rows = await self.store.leaderboard(umo, 10)
-            yield self._reply(event, render.leaderboard_card(self._day(), rows))
+            day = self._day()
+            rows = await self.store.leaderboard(umo, 10, day)
+            yield self._reply(event, render.leaderboard_card(day, rows))
 
         elif verb == "抢单":
             async for r in self._list_limited(umo, event):
@@ -332,7 +390,8 @@ class WaimaiPlugin(Star):
 
         elif verb == "商店":
             p = await self._player(event)
-            yield self._reply(event, render.shop_card(p))
+            page = "gear" if ("装备" in (arg or "") or "gear" in (arg or "").lower()) else "car"
+            yield self._reply(event, render.shop_card(p, page))
 
         elif verb == "买":
             async for r in self._buy(umo, arg, event):
@@ -468,7 +527,14 @@ class WaimaiPlugin(Star):
         # 生成器后面的 yield 全会被丢掉（群里只剩半截）。所以钱、时间、
         # 剧情必须拼在同一张卡里，不能拆成两条。
         story = await self._live_story(st, event, budget=2.5)
-        yield self._reply(event, render.settle_card(p, st, weather, peak, story=story))
+        try:
+            card = render.settle_card(p, st, weather, peak, story=story)
+        except Exception:
+            # 钱已经落盘了，这里再报「这单不算」就变成数据和说法打架
+            logger.exception("[waimai] 结算卡渲染失败")
+            card = (f"🛵 这单结算完成（{st.income:+d} 元），卡片没渲染出来，"
+                    f"💰 余额 {int(p.money)} 元。")
+        yield self._reply(event, card)
         await self._refill_narrator(event)
 
     async def _skip(self, umo: str, event: AstrMessageEvent):
@@ -554,13 +620,22 @@ class WaimaiPlugin(Star):
         if game.has_gear(p, "phone"):
             order.limit += 2
         weather, peak = self._weather(umo), is_peak(now)
-        st = settle(p, order, weather, peak, now, self._rng)
-        await self.store.save_player(umo, p)
-        if st.failed:
-            st.fail_reason = self.narrator.pick("fail", self._rng)
-        # 同样一条发完：抢单这条指令只 yield 一次，否则结算卡会被丢掉，
-        # 群里就只剩一句「抢到了」没有下文。
-        story = await self._live_story(st, event, budget=2.5)
+        # 抢到就意味着这一轮结束了：手上没挑的那批一起作废，
+        # 否则 #接 1 会在「已经跑完一单」之后再结算一张旧单。
+        p.pending = []
+        p.pending_at = 0.0
+        try:
+            st = settle(p, order, weather, peak, now, self._rng)
+            await self.store.save_player(umo, p)
+            if st.failed:
+                st.fail_reason = self.narrator.pick("fail", self._rng)
+            # 同样一条发完：抢单这条指令只 yield 一次，否则结算卡会被丢掉，
+            # 群里就只剩一句「抢到了」没有下文。
+            story = await self._live_story(st, event, budget=2.5)
+        except Exception:
+            # 结算炸了就把名额还回去，别让这单变成「已被抢走」永远消失
+            await self.store.release_limited(umo, day, idx)
+            raise
         yield self._reply(event, 
             f"⚡ {p.name} 抢到了！\n"
             + render.settle_card(p, st, weather, peak, story=story))
@@ -692,23 +767,30 @@ class WaimaiPlugin(Star):
             return
         day = self._day()
         for umo in await self.store.groups_with_players():
-            if await self.store.night_done(umo, day):
+            # 先占位再发：先查再发是 check-then-act，两次定时器/热重载撞一起会播两遍
+            if not await self.store.claim_night(umo, day):
                 continue
+            sent = False
             try:
-                rows = await self.store.leaderboard(umo, 10)
+                rows = await self.store.leaderboard(umo, 10, day)
                 if not rows:
+                    await self.store.release_night(umo, day)
                     continue
                 text = render.leaderboard_card(day, rows)
                 tomorrow = roll_weather(f"{umo}:{day_key(time.time() + 86400)}")
-                w = game.WEATHERS[tomorrow]
+                w = game.WEATHERS.get(tomorrow) or game.WEATHERS["sunny"]
                 text += f"\n\n明天 {w['emoji']} {w['name']}天"
                 if w["bonus"]:
                     text += f"，补贴 +{int(w['bonus'] * 100)}%"
                 text += "。收车吧，明早接着跑。"
                 await self.context.send_message(umo, MessageChain([Plain(text)]))
-                await self.store.mark_night(umo, day)
+                sent = True
             except Exception:
                 logger.exception(f"[waimai] 晚间播报失败：{umo}")
+            finally:
+                # 没发出去就把占位还回去，等下一个人/下一次还能播
+                if not sent:
+                    await self.store.release_night(umo, day)
 
     async def _weekly(self) -> None:
         for umo in await self.store.groups_with_players():

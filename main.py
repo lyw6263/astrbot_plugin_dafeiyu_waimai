@@ -29,14 +29,15 @@ from .core import game, render
 from .core.game import (
     DAY_ORDER_CAP, GEARS, LEVELS, MEAL_PER_DAY, MEAL_PRICE, MEAL_STAMINA,
     STAMINA_MAX, VEHICLES, Order, Player, day_key, is_peak,
-    make_orders, regen_stamina, roll_day, roll_weather, settle, vehicle_of,
+    make_orders, regen_stamina, roll_alert, roll_day, roll_weather, settle, vehicle_of,
 )
 from .core.narrator import Narrator
 from .core.store import Store
 
 VERBS = (
-    "接单", "派单", "抢单", "抄近道", "收入榜", "排行榜", "榜单", "我的", "状态",
-    "钱包", "商店", "吃饭", "修车", "签到", "帮助", "跳过", "接", "抢", "买", "叙事池",
+    "接单", "派单", "抢单", "抄近道", "收入榜", "排行榜", "榜单", "周榜", "总榜",
+    "我的", "状态", "钱包", "商店", "吃饭", "修车", "签到", "帮助", "跳过", "任务",
+    "押注", "打赏", "接", "抢", "买", "押", "叙事池",
 )
 _CMD_RE = re.compile(r"^(?P<verb>%s)\s*(?P<arg>.*)$" % "|".join(VERBS))
 _NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
@@ -88,7 +89,7 @@ def _parse_hhmm(text: str) -> tuple[int, int, bool]:
     "astrbot_plugin_dafeiyu_waimai",
     "dsh",
     "风里雨里 · 外卖骑手：群里接单送单，攒钱换车",
-    "v0.10.1",
+    "v0.11.0",
 )
 class WaimaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -196,6 +197,10 @@ class WaimaiPlugin(Star):
 
     def _weather(self, umo: str, now: float | None = None) -> str:
         return roll_weather(f"{umo}:{self._day(now)}")
+
+    def _alert(self, umo: str, now: float | None = None) -> dict | None:
+        """今天的突发天气（雷暴/大风/大雾），没有就是 None。"""
+        return roll_alert(f"{umo}:{self._day(now)}")
 
     def _reply(self, event: AstrMessageEvent, text: str):
         """群里的卡片一张接一张，谁也看不出是在回谁——每条都顶一个「@发起人」。
@@ -380,6 +385,26 @@ class WaimaiPlugin(Star):
             rows = await self.store.leaderboard(umo, 10, day)
             yield self._reply(event, render.leaderboard_card(day, rows))
 
+        elif verb == "周榜":
+            rows = await self.store.leaderboard(umo, 10, by="week")
+            yield self._reply(event, render.leaderboard_card(self._day(), rows, by="week"))
+
+        elif verb == "总榜":
+            rows = await self.store.leaderboard(umo, 10, by="total")
+            yield self._reply(event, render.leaderboard_card(self._day(), rows, by="total"))
+
+        elif verb == "任务":
+            p = await self._player(event)
+            yield self._reply(event, render.tasks_card(p))
+
+        elif verb in ("押", "押注"):
+            async for r in self._bet(umo, arg, event):
+                yield r
+
+        elif verb == "打赏":
+            async for r in self._tip(umo, arg, event):
+                yield r
+
         elif verb == "抢单":
             async for r in self._list_limited(umo, event):
                 yield r
@@ -480,6 +505,7 @@ class WaimaiPlugin(Star):
                 "先 #接 1 或者 #跳过。")
             return
         weather, peak = self._weather(umo, now), is_peak(now)
+        alert = self._alert(umo, now)
         shops = self.narrator.many_pool("shops")
         bulk_items = self.narrator.pick_many("bulk", 2, self._rng)
         notes = self.narrator.many_pool("note")
@@ -490,7 +516,7 @@ class WaimaiPlugin(Star):
         p.pending = [o.to_dict() for o in orders]
         p.pending_at = now
         await self.store.save_player(umo, p)
-        yield self._reply(event, render.dispatch_card(p, orders, weather, peak))
+        yield self._reply(event, render.dispatch_card(p, orders, weather, peak, alert))
         await self._refill_narrator(event)
 
     async def _take(self, umo: str, arg: str, event: AstrMessageEvent):
@@ -519,7 +545,8 @@ class WaimaiPlugin(Star):
         if shortcut:
             p.shortcut_armed = False
 
-        st = settle(p, order, weather, peak, now, self._rng, shortcut=shortcut)
+        st = settle(p, order, weather, peak, now, self._rng, shortcut=shortcut,
+                    alert=self._alert(umo, now))
         await self.store.save_player(umo, p)
         if st.failed:                     # 没送到：原因交给叙事池，卡片里要写清楚
             st.fail_reason = self.narrator.pick("fail", self._rng)
@@ -625,7 +652,8 @@ class WaimaiPlugin(Star):
         p.pending = []
         p.pending_at = 0.0
         try:
-            st = settle(p, order, weather, peak, now, self._rng)
+            st = settle(p, order, weather, peak, now, self._rng,
+                        alert=self._alert(umo, now))
             await self.store.save_player(umo, p)
             if st.failed:
                 st.fail_reason = self.narrator.pick("fail", self._rng)
@@ -760,6 +788,138 @@ class WaimaiPlugin(Star):
         await self.store.save_player(umo, p)
         yield self._reply(event, "🗺 把这片小区的后门都摸熟了，下一单不容易超时。")
 
+    # ------------------------------------------------------------ 押注 / 打赏
+
+    async def _find_player(self, umo: str, word: str) -> Player | None:
+        """按名字找人：先精确，再前缀，再包含（群昵称常带前缀后缀）。"""
+        word = (word or "").strip()
+        if not word:
+            return None
+        ps = await self.store.players(umo)
+        for p in ps:
+            if p.name == word:
+                return p
+        for p in ps:
+            if p.name.startswith(word):
+                return p
+        for p in ps:
+            if word in p.name:
+                return p
+        return None
+
+    async def _bet(self, umo: str, arg: str, event: AstrMessageEvent):
+        p = await self._player(event)
+        day = self._day()
+        raw = (arg or "").strip()
+        if not raw:
+            rows = await self.store.open_bets(umo, day)
+            yield self._reply(event, render.bets_card(rows, day))
+            return
+        m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", raw)
+        if not m:
+            yield self._reply(event, "押注这样写：#押 小王 100（名字 + 金额）")
+            return
+        name, stake = m.group(1), int(m.group(2))
+        if stake < 10:
+            yield self._reply(event, "押多少都行，但至少 10 元。")
+            return
+        target = await self._find_player(umo, name)
+        if target is None:
+            yield self._reply(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
+            return
+        if target.uid == p.uid:
+            yield self._reply(event, "押自己没意思——你的单得自己跑。")
+            return
+        if p.money < stake:
+            yield self._reply(event, f"💰 你手上只有 {int(p.money)} 元，押不起 {stake} 元。")
+            return
+        if not await self.store.place_bet(umo, day, p.uid, p.name,
+                                          target.uid, target.name, stake):
+            yield self._reply(event, "🎟 今天已经押过了，一人一天一注，等晚上开奖。")
+            return
+        p.money = float(round(p.money - stake))
+        await self.store.save_player(umo, p)
+        rows = await self.store.open_bets(umo, day)
+        yield self._reply(event, 
+            f"🎟 {p.name} 押 {target.name} 进今日前三，{stake} 元已进池。\n"
+            f"晚上九点开奖：押中平台赔你一倍，{target.name} 进前三还有彩头。\n\n"
+            + render.bets_card(rows, day))
+
+    async def _tip(self, umo: str, arg: str, event: AstrMessageEvent):
+        p = await self._player(event)
+        raw = (arg or "").strip()
+        m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", raw)
+        if not m:
+            yield self._reply(event, "打赏这样写：#打赏 小王 50（名字 + 金额）")
+            return
+        name, amount = m.group(1), int(m.group(2))
+        if amount < 1:
+            yield self._reply(event, "打赏金额得是正数。")
+            return
+        target = await self._find_player(umo, name)
+        if target is None:
+            yield self._reply(event, f"群里没找到「{name}」这个人，先让他发一次 #我的。")
+            return
+        if target.uid == p.uid:
+            yield self._reply(event, "自己给自己打赏，平台不收这种手续费。")
+            return
+        if p.money < amount:
+            yield self._reply(event, f"💰 你手上只有 {int(p.money)} 元，打赏不起 {amount} 元。")
+            return
+        p.money = float(round(p.money - amount))
+        target.money = float(round(target.money + amount))
+        await self.store.save_player(umo, p)
+        await self.store.save_player(umo, target)
+        yield self._reply(event, 
+            f"💝 {p.name} 给 {target.name} 打赏了 {amount} 元（不进今日榜，纯心意）。\n"
+            f"{target.name} 现在有 {int(target.money)} 元。")
+
+    async def _settle_bets(self, umo: str, day: str) -> list[str]:
+        """开奖：押「进今日前三」的人赢一倍（平台出钱），被押的人拿彩头。
+
+        押注时本金已经扣过了，赢了退两倍；被押的人没跑单/存档没了就原样退钱。
+        """
+        rows = await self.store.take_bets(umo, day)
+        if not rows:
+            return []
+        board = await self.store.leaderboard(umo, 100, day)
+        # 只有今天真的出了车的人才有名次。0 单也排上去的话，
+        # 群里就两个人的时候押谁都是「进前三」，那注等于白送钱。
+        rank = {p.uid: i for i, p in enumerate(board, start=1) if p.today_orders > 0}
+        everyone = {p.uid: p for p in await self.store.players(umo)}
+        lines: list[str] = []
+        for r in rows:
+            stake = int(r.get("stake") or 0)
+            bettor = everyone.get(str(r.get("bettor")))
+            target = everyone.get(str(r.get("target")))
+            bname = (bettor.name if bettor else r.get("bettor_name")) or "某人"
+            tname = (target.name if target else r.get("target_name")) or "某人"
+            if bettor is None or target is None or str(r.get("target")) not in rank:
+                # 没开成：本金原样退回，别让人白扣一笔
+                if bettor is not None:
+                    bettor.money = float(round(bettor.money + stake))
+                    await self.store.save_player(umo, bettor)
+                if target is not None and target.today_orders <= 0:
+                    why = "今天一单没跑"
+                elif target is None:
+                    why = "人找不到了"
+                else:
+                    why = "没赶上榜单"
+                lines.append(f"🎟 {bname} 押 {tname}：{why}，这注没开成，{stake} 元退回。")
+                continue
+            if rank[str(r.get("target"))] <= 3:
+                payout = max(1, stake // 2)
+                bettor.money = float(round(bettor.money + stake * 2))
+                target.money = float(round(target.money + payout))
+                lines.append(f"🎟 {bname} 押中 {tname} 进前三，赢 {stake} 元；"
+                             f"{tname} 拿彩头 {payout} 元。")
+                await self.store.save_player(umo, bettor)
+                await self.store.save_player(umo, target)
+            else:
+                lines.append(f"🎟 {bname} 押 {tname} 没进前三，{stake} 元归平台。")
+                await self.store.save_player(umo, bettor)
+        return lines
+
     # ------------------------------------------------------------ 定时任务
 
     async def _night(self) -> None:
@@ -777,6 +937,10 @@ class WaimaiPlugin(Star):
                     await self.store.release_night(umo, day)
                     continue
                 text = render.leaderboard_card(day, rows)
+                # 押注开奖：晚上播榜的时候一起算，押的人当晚就知道结果
+                bets = await self._settle_bets(umo, day)
+                if bets:
+                    text += "\n\n" + "\n".join(bets)
                 tomorrow = roll_weather(f"{umo}:{day_key(time.time() + 86400)}")
                 w = game.WEATHERS.get(tomorrow) or game.WEATHERS["sunny"]
                 text += f"\n\n明天 {w['emoji']} {w['name']}天"

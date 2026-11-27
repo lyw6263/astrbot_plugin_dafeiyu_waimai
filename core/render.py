@@ -5,7 +5,8 @@ from .game import (
     DAY_ORDER_CAP, DURABILITY_MAX, DURABILITY_WARN, GEARS, LEVELS, MEAL_PER_DAY,
     MEAL_PRICE, MEAL_STAMINA, RATING_MAX, STAMINA_MAX, VEHICLES, WEATHERS,
     Player, Order, Settlement, level_name, next_level_need,
-    order_income_hint, rating_bucket, repair_price, risk_label, vehicle_of,
+    order_income_hint, rating_bucket, repair_price, risk_label, task_progress,
+    vehicle_of,
 )
 
 BUCKET_TEXT = {
@@ -57,8 +58,20 @@ def header(p: Player, weather: str, peak: bool) -> str:
             f"今日 {p.today_orders} 单 {yuan(p.today_income)} 元")
 
 
-def dispatch_card(p: Player, orders: list[Order], weather: str, peak: bool) -> str:
-    lines = [header(p, weather, peak), weather_text(weather, peak), ""]
+def alert_line(alert: dict | None) -> str:
+    """突发天气那一行：加价多少、路难走多少，一句话说清。"""
+    if not alert:
+        return ""
+    sub = int(round(float(alert.get("subsidy") or 0.0) * 100))
+    return f"{alert['emoji']} {alert['name']} ｜ 平台临时加价 +{sub}%（路上更难跑）"
+
+
+def dispatch_card(p: Player, orders: list[Order], weather: str, peak: bool,
+                  alert: dict | None = None) -> str:
+    lines = [header(p, weather, peak), weather_text(weather, peak)]
+    if alert:
+        lines.append(alert_line(alert))
+    lines.append("")
     for o in orders:
         lift = "有电梯" if o.elevator else "无电梯"
         prob = order_income_hint(p, o, weather, peak)
@@ -121,6 +134,8 @@ def settle_card(p: Player, st: Settlement, weather: str, peak: bool,
                       else f"补贴 +{st.bonus}")
     if st.fine:
         detail.append(f"罚款 −{st.fine}")
+    if st.task_bonus:
+        detail.append(f"任务 +{st.task_bonus}")
     lines.append(f"💸 {yuan(st.income)} 元（{'，'.join(detail)}）")
 
     if st.bad_review:
@@ -285,17 +300,85 @@ def shop_card(p: Player, page: str = "car") -> str:
     return "\n".join(lines)
 
 
-def leaderboard_card(day: str, players: list[Player], limit: int = 10) -> str:
-    lines = [f"🏆 今日收入榜（{day}）"]
+def leaderboard_card(day: str, players: list[Player], limit: int = 10,
+                     by: str = "day") -> str:
+    """by: day(今日) / week(本周) / total(总榜)。同一张卡，换个标题和口径。"""
+    if by == "week":
+        lines = [f"🏆 本周收入榜（周收入，周一清零）"]
+    elif by == "total":
+        lines = [f"🏆 总榜（职业生涯累计）"]
+    else:
+        lines = [f"🏆 今日收入榜（{day}）"]
     if not players:
-        lines.append("今天还没人出车。")
+        if by == "week":
+            lines.append("这周还没人出车。")
+        elif by == "total":
+            lines.append("还没人跑过单。")
+        else:
+            lines.append("今天还没人出车。")
         return "\n".join(lines)
     for i, p in enumerate(players[:limit], start=1):
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
         v = vehicle_of(p)
-        lines.append(f"{medal} {p.name} {yuan(p.today_income)} 元 · {p.today_orders} 单 "
+        if by == "week":
+            money, unit = p.week_income, ""
+        elif by == "total":
+            money, unit = p.total_income, ""
+        else:
+            money, unit = p.today_income, f" · {p.today_orders} 单"
+        lines.append(f"{medal} {p.name} {yuan(money)} 元{unit} "
                      f"· ⭐{p.rating:.2f} {v['emoji']}")
-    lines.append("明天早上再排一次，跑得多的人钱多，跑得稳的人评分高。")
+    if by == "day":
+        lines.append("明天早上再排一次，跑得多的人钱多，跑得稳的人评分高。")
+    else:
+        lines.append("跑到哪一天，这一栏都算数。")
+    return "\n".join(lines)
+
+
+def tasks_card(p: Player) -> str:
+    lines = [f"📋 今日任务（{p.day or '今天'}）"]
+    tasks = [t for t in p.tasks if isinstance(t, dict)] if isinstance(p.tasks, list) else []
+    if not tasks:
+        lines.append("今天还没派任务，先 #接单 跑一单，任务就来了。")
+        return "\n".join(lines)
+    claimed = set(x for x in (p.tasks_claimed or []) if isinstance(x, str))
+    for i, t in enumerate(tasks, start=1):
+        done = t.get("id") in claimed
+        mark = "✅" if done else "⬜"
+        reward = int(t.get("reward") or 0)
+        lines.append(f"{mark} {i}. {t.get('text', '')}　+{reward} 元")
+        if done:
+            continue
+        cur, need = task_progress(t, p)
+        # 收入任务跑完一单亏了钱，进度会是负数——画面上从 0 起步就行
+        cur = max(0.0, float(cur))
+        # 进度条：别让人盯着一行字猜自己还差多少
+        ratio = 0.0 if need <= 0 else max(0.0, min(1.0, float(cur) / float(need)))
+        bar = "▰" * int(ratio * 10) + "▱" * (10 - int(ratio * 10))
+        lines.append(f"     {bar} {cur:.0f}/{need}")
+    left = [t for t in tasks if t.get("id") not in claimed]
+    if left:
+        lines.append("")
+        lines.append("达成了下一单结算时自动发钱，不用手领。")
+    else:
+        lines.append("")
+        lines.append("今天三个任务全清了，厉害。")
+    return "\n".join(lines)
+
+
+def bets_card(rows: list[dict], day: str) -> str:
+    """押注一览：谁押了谁、押了多少。"""
+    lines = [f"🎟 今日押注（{day}）"]
+    if not rows:
+        lines.append("还没人押注。")
+        lines.append("")
+        lines.append("#押 名字 金额 　比如 #押 小王 100（晚上九点开奖，押中平台赔双倍）")
+        return "\n".join(lines)
+    for r in rows:
+        lines.append(f"  {r.get('bettor_name') or '某人'} → 押 {r.get('target_name') or '某人'} "
+                     f"{int(r.get('stake') or 0)} 元")
+    lines.append("")
+    lines.append("晚上九点开奖：押中的人赢平台一倍，被押的人进前三还有彩头。")
     return "\n".join(lines)
 
 
@@ -308,6 +391,11 @@ def help_card() -> str:
         "#跳过    这一批不要，等下一批（⚡ 体力 −2）",
         "#我的    看车、评分、体力、余额、段位",
         "#收入榜  今天的群内排名",
+        "#周榜    这一周谁跑得最多",
+        "#总榜    职业生涯累计谁赚得多",
+        "#任务    今天的三件事，达成自动发钱",
+        "#押 名字 金额  押他今天能进前三（九点开奖，押中平台赔一倍）",
+        "#打赏 名字 金额  给跑得辛苦的群友塞点钱",
         "#抢单    限量单（30–60 元，全群先到先得）",
         "#抢 2    抢 2 号限量单（手快有手慢无）",
         "#商店    买车 / 买装备（10 台车 + 10 件装备）",
@@ -322,7 +410,8 @@ def help_card() -> str:
         "最多把这单的钱扣光，不倒欠；配送失败（联系不上人 / 门禁进不去 / 餐洒了）",
         "配送费全没，还要赔餐费 8–25 元，评分掉得更狠。准时送到达成好评有小费；",
         "一天最多 30 单，体力每 6 分钟回 1 点——别硬撑，先 #吃饭。",
-        "全群同一天气，天气会影响路上的顺不顺和补贴。",
+        "全群同一天气，天气会影响路上的顺不顺和补贴；偶尔还有雷暴、大风、大雾，",
+        "这种天平台会临时加价——钱多，路也难走。",
         "段位按本周收入升：青铜 → 白银 → 黄金 → 钻石 → 星耀 → 王者。",
         "10 台车各有脾气：🛴 滑板车省钱但只敢跑近单，🛺 三轮车能拉大件（+8 元），",
         "🚙 老头乐有棚不淋雨但怕交警，🏍 摩托能钻缝、跑单加价，🛻 小货车专接大件团餐，",

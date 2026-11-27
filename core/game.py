@@ -213,6 +213,7 @@ class Player:
     gear: list[str] = field(default_factory=list)
     orders: int = 0                       # 累计接单
     week_income: float = 0.0
+    total_income: float = 0.0             # 职业生涯累计净收入（总榜用，永不清零）
     level: int = 0
     day: str = ""                         # 今日日期（YYYY-MM-DD）
     today_orders: int = 0
@@ -231,6 +232,8 @@ class Player:
     created: float = 0.0
     checkin_day: str = ""                 # 上次签到的日期（YYYY-MM-DD）
     checkin_streak: int = 0               # 连签天数
+    tasks: list = field(default_factory=list)            # 今日任务（3 条，按天生成）
+    tasks_claimed: list = field(default_factory=list)   # 今天已经领过的任务 id
 
     # -- 序列化
     # 钱一律按「整元」存档：结算时就 round 好，这里再 round 一次兜底。
@@ -244,6 +247,7 @@ class Player:
             "veh_ver": VEHICLE_INDEX_VER,
             "gear": list(self.gear), "orders": int(self.orders),
             "week_income": int(round(self.week_income)), "level": int(self.level),
+            "total_income": int(round(self.total_income)),
             "day": self.day, "today_orders": int(self.today_orders),
             "today_income": int(round(self.today_income)),
             "today_bad": int(self.today_bad),
@@ -252,6 +256,8 @@ class Player:
             "shortcut_day": self.shortcut_day, "shortcut_armed": bool(self.shortcut_armed),
             "on_time_streak": int(self.on_time_streak),
             "checkin_day": self.checkin_day, "checkin_streak": int(self.checkin_streak),
+            "tasks": _norm_tasks(self.tasks),
+            "tasks_claimed": [str(x) for x in self.tasks_claimed if isinstance(x, str)],
             "pending": _deep_copy_pending(self.pending), "pending_at": float(self.pending_at),
             "last_cmd": float(self.last_cmd),
             "created": float(self.created),
@@ -280,6 +286,7 @@ class Player:
         p.gear = [str(g) for g in gear if isinstance(g, str)] if isinstance(gear, list) else []
         p.orders = _i(d.get("orders"), 0)
         p.week_income = _f(d.get("week_income"), 0.0)
+        p.total_income = _f(d.get("total_income"), 0.0)
         p.level = _i(d.get("level"), 0)
         p.day = str(d.get("day") or "")
         p.today_orders = _i(d.get("today_orders"), 0)
@@ -294,6 +301,9 @@ class Player:
         p.on_time_streak = _i(d.get("on_time_streak"), 0)
         p.checkin_day = str(d.get("checkin_day") or "")
         p.checkin_streak = _i(d.get("checkin_streak"), 0)
+        p.tasks = _norm_tasks(d.get("tasks"))
+        claimed = d.get("tasks_claimed")
+        p.tasks_claimed = [str(x) for x in claimed if isinstance(x, str)] if isinstance(claimed, list) else []
         pending = d.get("pending")
         p.pending = [x for x in pending if isinstance(x, dict)] if isinstance(pending, list) else []
         p.pending_at = _f(d.get("pending_at"), 0.0)
@@ -381,6 +391,7 @@ class Settlement:
     broke: bool = False          # 今日 4 差评罚金触发
     day_penalty: int = 0         # 今日 4 差评罚掉的钱（单列，不计进本单 income）
     unpaid: float = 0.0          # 余额不够、平台替你兜掉的罚款
+    task_bonus: int = 0          # 今天完成的任务奖励（已并进 income）
     accident: bool = False
     failed: bool = False         # 配送失败：没送到，赔付餐费
     fail_reason: str = ""       # 为什么没送到（由叙事池给出，结算卡里播）
@@ -496,6 +507,114 @@ def roll_weather(seed_key: str) -> str:
     return "snow"
 
 
+# ---------------------------------------------------------------- 突发天气 / 每日任务
+
+# 一天的天气之外，偶尔再来一场「突发」：全群同一天，来了就是一天。
+# 补贴给得痛快，路也难走得痛快——群里会一起喊苦，这就对了。
+ALERTS = [
+    {"id": "thunder", "name": "雷暴", "emoji": "⛈️",
+     "subsidy": 0.50, "timeout": 0.10, "text": "雷暴，路上全是积水，谁也跑不快"},
+    {"id": "wind", "name": "大风", "emoji": "🌬️",
+     "subsidy": 0.35, "timeout": 0.08, "text": "大风，车把直打晃"},
+    {"id": "fog", "name": "大雾", "emoji": "🌫️",
+     "subsidy": 0.30, "timeout": 0.06, "text": "大雾，路口什么都看不清"},
+]
+ALERT_RATE = 0.16          # 大约 6 天里来一场
+
+
+def roll_alert(seed_key: str) -> dict | None:
+    """今天有没有突发天气：由 (群, 日期) 决定性生成，和 roll_weather 同一套种子。"""
+    digest = hashlib.blake2b(f"alert|{seed_key}".encode("utf-8"), digest_size=8).digest()
+    rng = random.Random(int.from_bytes(digest, "big"))
+    if rng.random() >= ALERT_RATE:
+        return None
+    return ALERTS[rng.randrange(len(ALERTS))]
+
+
+# 每天三个任务，按 (玩家, 日期) 决定，重启也不会变。
+TASK_POOL = [
+    {"id": "orders", "kind": "orders", "n": (5, 8), "reward": 25,
+     "text": "今天跑满 {n} 单"},
+    {"id": "clean", "kind": "clean", "n": (3, 3), "reward": 20,
+     "text": "今天至少 {n} 单，一个差评都不挨"},
+    {"id": "income", "kind": "income", "n": (120, 200), "reward": 30,
+     "text": "今天收入凑够 {n} 元"},
+    {"id": "ontime", "kind": "ontime", "n": (3, 5), "reward": 20,
+     "text": "今天连着 {n} 单准时"},
+    {"id": "long", "kind": "income", "n": (250, 320), "reward": 35,
+     "text": "今天收入凑够 {n} 元"},
+]
+
+
+def make_tasks(seed_key: str) -> list[dict]:
+    """一天三个任务：种类不重复，门槛按种子定，重启后还是这三条。"""
+    digest = hashlib.blake2b(f"task|{seed_key}".encode("utf-8"), digest_size=8).digest()
+    rng = random.Random(int.from_bytes(digest, "big"))
+    picked: list[dict] = []
+    kinds: set[str] = set()
+    pool = list(TASK_POOL)
+    rng.shuffle(pool)
+    for t in pool:
+        if t["kind"] in kinds and len(picked) < 3:
+            continue
+        kinds.add(t["kind"])
+        lo, hi = t["n"]
+        need = rng.randint(int(lo), int(hi))
+        picked.append({"id": t["id"], "kind": t["kind"], "n": int(need),
+                       "reward": int(t["reward"]), "text": t["text"].format(n=int(need))})
+    return picked[:3]
+
+
+def task_done(t: dict, p: Player) -> bool:
+    kind = t.get("kind")
+    need = int(t.get("n") or 0)
+    if kind == "orders":
+        return p.today_orders >= need
+    if kind == "clean":
+        return p.today_orders >= need and p.today_bad == 0
+    if kind == "income":
+        return p.today_income >= need
+    if kind == "ontime":
+        return p.on_time_streak >= need
+    return False
+
+
+def task_progress(t: dict, p: Player) -> tuple[float, int]:
+    """(当前进度, 目标)，给卡片画进度条用。"""
+    kind = t.get("kind")
+    need = int(t.get("n") or 0)
+    if kind == "orders":
+        return float(p.today_orders), need
+    if kind == "clean":
+        # 挨了差评就直接画满（表示这条已经黄了，别再吊着）
+        if p.today_bad > 0:
+            return float(need), need
+        return float(min(p.today_orders, need)), need
+    if kind == "income":
+        return float(float(p.today_income)), need
+    if kind == "ontime":
+        return float(p.on_time_streak), need
+    return 0.0, need
+
+
+def _norm_tasks(raw) -> list[dict]:
+    """存档里的任务列表：能用的留下，坏的丢掉（旧存档没有这个字段）。"""
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for t in raw:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("id") or "")
+        kind = str(t.get("kind") or "")
+        text = str(t.get("text") or "")
+        if not tid or not kind or not text:
+            continue
+        out.append({"id": tid, "kind": kind, "n": _i(t.get("n"), 1),
+                    "reward": _i(t.get("reward"), 0), "text": text})
+    return out
+
+
 def regen_stamina(p: Player, now: float) -> bool:
     """懒计算体力恢复，返回是否有变化。"""
     if p.stamina_at <= 0:
@@ -542,6 +661,9 @@ def roll_day(p: Player, now: float) -> bool:
     p.pending = []
     p.pending_at = 0.0
     p.shortcut_armed = False
+    # 今天的三个任务：按 (玩家, 日期) 决定，重启也还是这三条
+    p.tasks = make_tasks(f"{p.uid}:{d}")
+    p.tasks_claimed = []
     return True
 
 
@@ -557,7 +679,8 @@ def rating_bucket(p: Player) -> str:
 
 # ---------------------------------------------------------------- 派单
 
-def _timeout_probability(order: Order, p: Player, weather: str, peak: bool) -> float:
+def _timeout_probability(order: Order, p: Player, weather: str, peak: bool,
+                         alert: dict | None = None) -> float:
     w = WEATHERS.get(weather) or WEATHERS["sunny"]
     veh = vehicle_of(p)
     # 基准超时率：老手、中等距离、有电梯、天气好这一档，超时约 24%；
@@ -575,6 +698,10 @@ def _timeout_probability(order: Order, p: Player, weather: str, peak: bool) -> f
     elif wt > 0 and has_gear(p, "raincoat"):
         wt *= 0.5
     prob += wt
+    if alert:
+        # 雷暴/大风/大雾是全城一起难跑：有棚的车减半，别人硬扛
+        a = float(alert.get("timeout") or 0.0)
+        prob += a * (0.5 if veh.get("weather_immune") else 1.0)
     if peak:
         prob += veh.get("peak_mod", 0.08)     # 摩托能钻缝，只 +3%
         prob += veh.get("peak_extra", 0.0)    # 四轮堵车，汽车 +10% / 老头乐 +6%
@@ -801,7 +928,8 @@ def _late_penalty(pay: int, late_min: float) -> int:
 
 
 def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
-           rng: random.Random, shortcut: bool = False) -> Settlement:
+           rng: random.Random, shortcut: bool = False,
+           alert: dict | None = None) -> Settlement:
     """结算一单。会就地修改玩家状态（体力/余额/评分/今日统计）。
 
     同一单只能结算一次：order.settled 落成 True 后重复调用直接抛 ValueError，
@@ -813,7 +941,7 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
         weather = "sunny"
     veh = vehicle_of(p)
     w = WEATHERS[weather]
-    prob = _timeout_probability(order, p, weather, peak)
+    prob = _timeout_probability(order, p, weather, peak, alert)
     if shortcut:
         prob = max(0.02, prob - 0.15)
     punctured = False                # 本单刚爆的胎：这一单不算在「带病 3 单」里
@@ -943,6 +1071,14 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
         st.bonus += extra
         st.events.append(f"{w['emoji']} {w['name']}天，平台发了笔天气补贴")
 
+    # ---- 突发天气的临时加价：全城都在抢单，平台肯多给
+    if alert:
+        base = max(0, int(round(st.delivery_fee)))
+        extra = int(round(base * float(alert.get("subsidy") or 0.0)))
+        if extra > 0:
+            st.bonus += extra
+            st.events.append(f"{alert['emoji']} {alert['name']}，平台临时加价")
+
     st.cost = veh["cost"]
     if p.level >= 5:
         st.cost = 0                  # 王者：平台补贴车辆损耗
@@ -973,8 +1109,25 @@ def settle(p: Player, order: Order, weather: str, peak: bool, now: float,
     p.today_orders += 1
     p.today_income = float(round(p.today_income + st.income, 2))
     p.week_income = float(round(p.week_income + st.income, 2))
+    p.total_income = float(round(p.total_income + st.income, 2))
     p.rating = max(RATING_MIN, min(RATING_MAX, p.rating))
     order.settled = True            # 同一单不许结算第二次
+
+    # ---- 今日任务：达成了当场发钱（每项每天只发一次）
+    for t in _norm_tasks(p.tasks):
+        if t["id"] in p.tasks_claimed or not task_done(t, p):
+            continue
+        reward = int(t.get("reward") or 0)
+        if reward <= 0:
+            continue
+        p.tasks_claimed.append(t["id"])
+        st.task_bonus += reward
+        st.events.append(f"📋 任务完成：{t['text']}（+{reward} 元）")
+    if st.task_bonus:
+        p.money = float(round(p.money + st.task_bonus))
+        p.today_income = float(round(p.today_income + st.task_bonus, 2))
+        p.week_income = float(round(p.week_income + st.task_bonus, 2))
+        st.income += st.task_bonus
 
     # 今日 4 个差评 → 当日总收入 −15%（一次性）
     if p.today_bad >= 4 and not p.today_penalty:

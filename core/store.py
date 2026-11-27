@@ -1,7 +1,7 @@
-"""aiosqlite 存档：玩家 / 群 / 每日限量单。
+"""aiosqlite 存档：玩家 / 群 / 每日限量单 / 押注。
 
-只有三张表，所有写入都走一把 asyncio.Lock —— 群机器人并发不高，
-但「抢单」必须原子，所以宁可慢一点。
+只有几张表，所有写入都走一把 asyncio.Lock —— 群机器人并发不高，
+但「抢单」「押注」必须原子，所以宁可慢一点。
 """
 from __future__ import annotations
 
@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key    TEXT NOT NULL,
     value  TEXT NOT NULL,
     PRIMARY KEY (umo, key)
+);
+CREATE TABLE IF NOT EXISTS bets (
+    umo        TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    bettor     TEXT NOT NULL,             -- 押注的人
+    bettor_name TEXT NOT NULL DEFAULT '',
+    target     TEXT NOT NULL,             -- 被押的骑手
+    target_name TEXT NOT NULL DEFAULT '',
+    stake      INTEGER NOT NULL,
+    created    REAL NOT NULL,
+    PRIMARY KEY (umo, day, bettor)        -- 同一天同一个人只能押一注
 );
 """
 
@@ -186,15 +197,64 @@ class Store:
         return out
 
     async def leaderboard(self, umo: str, limit: int = 10,
-                          day: str = "") -> list[Player]:
-        """今日收入榜。
+                          day: str = "", by: str = "day") -> list[Player]:
+        """收入榜。by: day(今日) / week(本周) / total(总榜)。
 
-        必须按 p.day 过滤：存档里的 today_income 是「那一天的」，昨天跑完没再上线的
-        人若不过滤，会带着昨天的钱挂在今天的榜上（标题却写着今天）。
+        今日榜必须按 p.day 过滤：存档里的 today_income 是「那一天的」，昨天跑完
+        没再上线的人若不过滤，会带着昨天的钱挂在今天的榜上（标题却写着今天）。
+        周榜/总榜不过滤日期 —— 周收入本来就是跨天的，总榜更是从头攒的。
         """
+        ps = await self.players(umo)
+        if by == "week":
+            ps = [p for p in ps if p.week_income > 0]
+            return sorted(ps, key=lambda x: -x.week_income)[:limit]
+        if by == "total":
+            ps = [p for p in ps if p.total_income > 0]
+            return sorted(ps, key=lambda x: -x.total_income)[:limit]
         day = day or time.strftime("%Y-%m-%d")
-        ps = [p for p in await self.players(umo) if p.day == day]
+        ps = [p for p in ps if p.day == day]
         return sorted(ps, key=lambda x: -x.today_income)[:limit]
+
+    # ------------------------------------------------------------ 押注
+
+    async def place_bet(self, umo: str, day: str, bettor: str, bettor_name: str,
+                        target: str, target_name: str, stake: int) -> bool:
+        """押一注。同一天同一个人只能押一次（靠主键 INSERT OR IGNORE 挡）。"""
+        async with self._lock:
+            cur = await self.db.execute(
+                "INSERT OR IGNORE INTO bets(umo,day,bettor,bettor_name,target,target_name,"
+                "stake,created) VALUES(?,?,?,?,?,?,?,?)",
+                (umo, day, str(bettor), bettor_name or "", str(target), target_name or "",
+                 int(stake), time.time()),
+            )
+            await self.db.commit()
+            return cur.rowcount == 1
+
+    async def open_bets(self, umo: str, day: str) -> list[dict]:
+        """这一天还没结算的押注（只给人看，不动账）。"""
+        async with self._lock:
+            cur = await self.db.execute(
+                "SELECT bettor,bettor_name,target,target_name,stake FROM bets "
+                "WHERE umo=? AND day=? ORDER BY created",
+                (umo, day),
+            )
+            rows = await cur.fetchall()
+        return [{"bettor": r[0], "bettor_name": r[1], "target": r[2],
+                 "target_name": r[3], "stake": int(r[4])} for r in rows]
+
+    async def take_bets(self, umo: str, day: str) -> list[dict]:
+        """把这一天的押注全部取走并删除 —— 取到了就只结算一次，不会重复开奖。"""
+        async with self._lock:
+            cur = await self.db.execute(
+                "SELECT bettor,bettor_name,target,target_name,stake FROM bets "
+                "WHERE umo=? AND day=? ORDER BY created",
+                (umo, day),
+            )
+            rows = await cur.fetchall()
+            await self.db.execute("DELETE FROM bets WHERE umo=? AND day=?", (umo, day))
+            await self.db.commit()
+        return [{"bettor": r[0], "bettor_name": r[1], "target": r[2],
+                 "target_name": r[3], "stake": int(r[4])} for r in rows]
 
     async def week_rollover(self, umo: str, week: str = "") -> list[tuple[str, str, str]]:
         """周一结算：按周收入升段位，返回 [(名字, 旧段位, 新段位)]。

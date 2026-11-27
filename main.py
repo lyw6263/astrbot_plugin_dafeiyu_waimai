@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
@@ -89,7 +89,7 @@ def _parse_hhmm(text: str) -> tuple[int, int, bool]:
     "astrbot_plugin_dafeiyu_waimai",
     "dsh",
     "风里雨里 · 外卖骑手：群里接单送单，攒钱换车",
-    "v0.11.0",
+    "v0.12.0",
 )
 class WaimaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -101,6 +101,8 @@ class WaimaiPlugin(Star):
         self.night_broadcast = bool(conf.get("night_broadcast", True))
         # 每单现编剧情（直接调大肥鱼背后的模型），关掉就只用池子里的素材
         self.live_ai = bool(conf.get("live_ai", True))
+        # 长卡片（派单/结算/商店/榜单/帮助）渲染成图片发出去；渲染不出来自动退回文字
+        self.image_cards = bool(conf.get("image_cards", True))
         try:
             self.live_timeout = max(1.0, min(15.0, float(conf.get("live_timeout", 10.0))))
         except Exception:
@@ -202,11 +204,13 @@ class WaimaiPlugin(Star):
         """今天的突发天气（雷暴/大风/大雾），没有就是 None。"""
         return roll_alert(f"{umo}:{self._day(now)}")
 
-    def _reply(self, event: AstrMessageEvent, text: str):
+    def _reply(self, event: AstrMessageEvent, text: str, image: Image | None = None):
         """群里的卡片一张接一张，谁也看不出是在回谁——每条都顶一个「@发起人」。
 
         同一条指令出第二、三张卡（结算卡后面跟故事卡）时改成「@名字」纯文字：
         看着还是他的单，但不再多打一次提醒。私聊不 @（就两个人，反而碍眼）。
+
+        带 image 时只发图不发文字：卡片内容已经在图里，再贴一遍纯文字占两屏。
         """
         try:
             if not event.is_private_chat():
@@ -217,16 +221,50 @@ class WaimaiPlugin(Star):
                 except Exception:
                     pass
                 if uid:
-                    if getattr(event, "_waimai_at_done", False) and name:
-                        return event.plain_result(f"@{name} \n{text}")
+                    if getattr(event, "_waimai_at_done", False):
+                        if image is not None:
+                            return event.chain_result([image])
+                        if name:
+                            return event.plain_result(f"@{name} \n{text}")
                     try:
                         setattr(event, "_waimai_at_done", True)
                     except Exception:
                         pass
-                    return event.chain_result([At(qq=uid), Plain("\n" + text)])
+                    head = [At(qq=uid)]
+                    if image is not None:
+                        return event.chain_result(head + [image])
+                    return event.chain_result(head + [Plain("\n" + text)])
         except Exception:
             pass
+        if image is not None:
+            try:
+                return event.chain_result([image])
+            except Exception:
+                pass
         return event.plain_result(text)
+
+    async def _to_image(self, text: str, umo: str) -> Image | None:
+        """把卡片渲染成图片；没配文转图服务或渲染失败就返回 None（退回纯文字）。"""
+        if not self.image_cards or not text:
+            return None
+        try:
+            path = await self.text_to_image(text, return_url=False, umo=umo)
+        except Exception as e:
+            logger.warning(f"[waimai] 卡片渲染成图失败，改发文字：{type(e).__name__}: {e}")
+            return None
+        if not path:
+            return None
+        try:
+            p = str(path)
+            return Image(file=p) if p.startswith(("http://", "https://")) else Image.fromFileSystem(p)
+        except Exception as e:
+            logger.warning(f"[waimai] 图片组件创建失败，改发文字：{type(e).__name__}: {e}")
+            return None
+
+    async def _card(self, event: AstrMessageEvent, text: str):
+        """长卡片（派单/结算/商店/榜单/帮助…）优先发成图，渲染不出来退回文字。"""
+        image = await self._to_image(text, event.unified_msg_origin)
+        return self._reply(event, text, image=image)
 
     async def _player(self, event: AstrMessageEvent) -> Player:
         umo = event.unified_msg_origin
@@ -362,7 +400,7 @@ class WaimaiPlugin(Star):
         umo = event.unified_msg_origin
 
         if verb in ("帮助",):
-            yield self._reply(event, render.help_card())
+            yield await self._card(event, render.help_card())
 
         elif verb in ("接单", "派单"):
             async for r in self._dispatch_orders(umo, event):
@@ -378,24 +416,24 @@ class WaimaiPlugin(Star):
 
         elif verb in ("我的", "状态", "钱包"):
             p = await self._player(event)
-            yield self._reply(event, render.status_card(p, self._weather(umo), is_peak(time.time())))
+            yield await self._card(event, render.status_card(p, self._weather(umo), is_peak(time.time())))
 
         elif verb in ("收入榜", "排行榜", "榜单"):
             day = self._day()
             rows = await self.store.leaderboard(umo, 10, day)
-            yield self._reply(event, render.leaderboard_card(day, rows))
+            yield await self._card(event, render.leaderboard_card(day, rows))
 
         elif verb == "周榜":
             rows = await self.store.leaderboard(umo, 10, by="week")
-            yield self._reply(event, render.leaderboard_card(self._day(), rows, by="week"))
+            yield await self._card(event, render.leaderboard_card(self._day(), rows, by="week"))
 
         elif verb == "总榜":
             rows = await self.store.leaderboard(umo, 10, by="total")
-            yield self._reply(event, render.leaderboard_card(self._day(), rows, by="total"))
+            yield await self._card(event, render.leaderboard_card(self._day(), rows, by="total"))
 
         elif verb == "任务":
             p = await self._player(event)
-            yield self._reply(event, render.tasks_card(p))
+            yield await self._card(event, render.tasks_card(p))
 
         elif verb in ("押", "押注"):
             async for r in self._bet(umo, arg, event):
@@ -416,7 +454,7 @@ class WaimaiPlugin(Star):
         elif verb == "商店":
             p = await self._player(event)
             page = "gear" if ("装备" in (arg or "") or "gear" in (arg or "").lower()) else "car"
-            yield self._reply(event, render.shop_card(p, page))
+            yield await self._card(event, render.shop_card(p, page))
 
         elif verb == "买":
             async for r in self._buy(umo, arg, event):
@@ -516,7 +554,7 @@ class WaimaiPlugin(Star):
         p.pending = [o.to_dict() for o in orders]
         p.pending_at = now
         await self.store.save_player(umo, p)
-        yield self._reply(event, render.dispatch_card(p, orders, weather, peak, alert))
+        yield await self._card(event, render.dispatch_card(p, orders, weather, peak, alert))
         await self._refill_narrator(event)
 
     async def _take(self, umo: str, arg: str, event: AstrMessageEvent):
@@ -561,7 +599,7 @@ class WaimaiPlugin(Star):
             logger.exception("[waimai] 结算卡渲染失败")
             card = (f"🛵 这单结算完成（{st.income:+d} 元），卡片没渲染出来，"
                     f"💰 余额 {int(p.money)} 元。")
-        yield self._reply(event, card)
+        yield await self._card(event, card)
         await self._refill_narrator(event)
 
     async def _skip(self, umo: str, event: AstrMessageEvent):
@@ -612,7 +650,7 @@ class WaimaiPlugin(Star):
             yield self._reply(event, f"🚫 {bad}")
             return
         slots = await self.store.ensure_limited(umo, self._day(), self._limited_orders(umo, self._day()))
-        yield self._reply(event, render.limited_card(slots, self._weather(umo), p))
+        yield await self._card(event, render.limited_card(slots, self._weather(umo), p))
 
     async def _grab(self, umo: str, arg: str, event: AstrMessageEvent):
         p = await self._player(event)
@@ -813,7 +851,7 @@ class WaimaiPlugin(Star):
         raw = (arg or "").strip()
         if not raw:
             rows = await self.store.open_bets(umo, day)
-            yield self._reply(event, render.bets_card(rows, day))
+            yield await self._card(event, render.bets_card(rows, day))
             return
         m = re.match(r"^\s*(\S+)\s+(\d+)\s*$", raw)
         if not m:
@@ -947,7 +985,9 @@ class WaimaiPlugin(Star):
                 if w["bonus"]:
                     text += f"，补贴 +{int(w['bonus'] * 100)}%"
                 text += "。收车吧，明早接着跑。"
-                await self.context.send_message(umo, MessageChain([Plain(text)]))
+                image = await self._to_image(text, umo)
+                chain = [image] if image is not None else [Plain(text)]
+                await self.context.send_message(umo, MessageChain(chain))
                 sent = True
             except Exception:
                 logger.exception(f"[waimai] 晚间播报失败：{umo}")

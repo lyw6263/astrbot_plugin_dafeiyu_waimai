@@ -2,7 +2,7 @@ name: astrbot_plugin_dafeiyu_waimai
 display_name: 风里雨里 · 外卖骑手
 desc: 群里跑单的小游戏——#接单 派三张单，挑一张跑，超时扣钱，攒钱换车换装备，晚上九点播收入榜
 help: "#接单 派三张外卖单；#接 1 接第 1 张（#接 2 / #接 3）；#跳过 等下一批；#我的 看车/评分/体力/余额；#商店 买车买装备；#吃饭 花 15 元回 40 体力；#抢单 全群抢限量单；#收入榜 今日排名"
-version: v0.11.0
+version: v0.12.0
 author: dsh
 repo: https://github.com/lyw6263/astrbot_plugin_dafeiyu_waimai
 support_platforms:

@@ -89,7 +89,7 @@ def _parse_hhmm(text: str) -> tuple[int, int, bool]:
     "astrbot_plugin_dafeiyu_waimai",
     "dsh",
     "风里雨里 · 外卖骑手：群里接单送单，攒钱换车",
-    "v0.13.0",
+    "v0.13.1",
 )
 class WaimaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:

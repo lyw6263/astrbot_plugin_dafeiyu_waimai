@@ -1,6 +1,6 @@
 """把卡片画成一张好看的图（Pillow 直接绘制，不依赖文转图服务）。
 
-设计稿的思路：深色底 + 圆角面板 + 一个主色（橙）+ 彩色 emoji 图标。
+设计稿的思路：浅灰纸底 + 白面板 + 一个主色（橙）+ 彩色 emoji 图标。
 `render_card(spec)` 只认一种「卡片描述」，各业务卡片在 core/cards.py 里拼描述，
 这样改版式只要动这一个文件。
 """
@@ -15,22 +15,25 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 # ------------------------------------------------------------------ 配色
-BG = "#0f1116"
-PANEL = "#191c24"
-PANEL_ALT = "#1f232d"
-PANEL_SOFT = "#232834"
-LINE = "#2a303c"
-INK = "#e9ecf1"
-MUTED = "#8b93a3"
-DIM = "#5f6877"
+# 浅色（纸感）主题：灰白底 + 白面板 + 一道橙色主色。深色底在群里太"闷"，
+# 而且晚上看久了眼睛累，所以默认走浅色；这里的分层是「底灰 → 面板白 →
+# 面板内浅填充」，靠三层亮度差拉开层次，不靠描边。
+BG = "#e9edf3"
+PANEL = "#ffffff"
+PANEL_ALT = "#fbfcfe"
+PANEL_SOFT = "#f1f4f9"
+LINE = "#dde3ec"
+INK = "#171a21"
+MUTED = "#5b6472"
+DIM = "#6f7787"
 
-ACCENT = "#ff8b3d"       # 主色：外卖橙
-ACCENT_SOFT = "#3a2517"
-BLUE = "#5aa9ff"
-GREEN = "#3ddc84"
-RED = "#ff6b6b"
-YELLOW = "#ffcc55"
-PURPLE = "#b98cff"
+ACCENT = "#c2410c"       # 主色：外卖橙（浅底上要压深一点才够对比度）
+ACCENT_SOFT = "#fff1e6"
+BLUE = "#1a6fe0"
+GREEN = "#0a7d43"
+RED = "#cf2f28"
+YELLOW = "#96601a"
+PURPLE = "#7a4fd0"
 
 TONE = {
     "accent": ACCENT,
@@ -46,6 +49,9 @@ WIDTH = 900
 PAD = 34
 GAP = 16
 RADIUS = 22
+CARD_MARGIN = 16   # 卡片离图边留多少（露出的那圈灰底）
+CARD_PAD = 26      # 卡片内边距
+TRACK = "#dfe4ec"  # 进度条的槽（比面板灰一点才看得见）
 
 # ------------------------------------------------------------------ 字体
 # 先找插件自带的（data/fonts 里放字体就优先用），再找系统字体。
@@ -289,36 +295,52 @@ def render_card(spec: dict) -> Image.Image:
     }
     """
     accent = color(spec.get("accent"))
-    content_w = WIDTH - PAD * 2
+    content_w = WIDTH - (CARD_MARGIN + CARD_PAD) * 2
 
     # 先按「大概多高」铺一张足够长的画布，画完再按实际底部裁掉多余空白。
     # 用估算高度去排位置很容易估少（emoji、换行都会多占几行），一估少就压字。
     est = _measure_header(spec, content_w) + 30
     for blk in spec.get("blocks") or []:
         est += _measure_block(blk, content_w) + GAP
-    est = int(max(200, est * 1.35)) + (140 if spec.get("footer") else 0)
+    est = int(max(220, est * 1.35)) + (140 if spec.get("footer") else 0)
     # 画一遍；要是发现画布不够高（底部被切了），就加高重画一遍。
     # 千万别用 min(est, 实际底部) 直接裁——est 估少的那次会把卡片底边切掉。
     for _ in range(3):
-        img = Image.new("RGB", (WIDTH, est), BG)
-        draw = ImageDraw.Draw(img)
+        # 内容先画在透明层上，最后贴到白色卡片里：这样卡片边缘、圆角、
+        # 顶部那条主色都只画一次，内容溢出也不会盖到卡片外面去。
+        layer = Image.new("RGBA", (WIDTH, est), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
 
-        # 顶部一条主色渐层，给整张图一个「头」
-        for i in range(6):
-            c = _mix(accent, BG, 1 - (i + 1) / 7)
-            draw.rectangle((0, i * 2, WIDTH, i * 2 + 2), fill=c)
-
-        y = PAD
-        y += _draw_header(draw, spec, PAD, y, content_w, accent) + GAP
+        x = CARD_MARGIN + CARD_PAD
+        y = CARD_MARGIN + CARD_PAD + 8
+        y += _draw_header(draw, spec, x, y, content_w, accent) + GAP
         for blk in spec.get("blocks") or []:
-            y += _draw_block(draw, blk.get("kind", "note"), blk, PAD, y, content_w, accent) + GAP
+            y += _draw_block(draw, blk.get("kind", "note"), blk, x, y, content_w, accent) + GAP
         if spec.get("footer"):
-            y += _draw_footer(draw, spec["footer"], PAD, y + 6, content_w)
-        need = int(y + PAD - GAP / 2)
+            y += _draw_footer(draw, spec["footer"], x, y + 6, content_w)
+        need = int(y + CARD_PAD + CARD_MARGIN - GAP / 2)
         if need <= est:
             break
         est = need + 140
-    return img.crop((0, 0, WIDTH, max(132, need)))
+    need = max(150, need)
+
+    fig = Image.new("RGB", (WIDTH, est), BG)
+    # 卡片下垫一层很淡的投影，白卡片才不会跟灰底糊在一起
+    shadow = Image.new("RGBA", (WIDTH, est), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    for i in range(7, 0, -1):
+        sd.rounded_rectangle((CARD_MARGIN - i, CARD_MARGIN - i + 3,
+                              WIDTH - CARD_MARGIN + i, need - CARD_MARGIN + i + 3),
+                             radius=28 + i, fill=(18, 24, 38, 7))
+    img = Image.alpha_composite(fig.convert("RGBA"), shadow)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((CARD_MARGIN, CARD_MARGIN, WIDTH - CARD_MARGIN, need - CARD_MARGIN),
+                           radius=28, fill=PANEL, outline=LINE, width=2)
+    # 卡片顶上一条主色细条，像工牌上那条带子
+    draw.rounded_rectangle((CARD_MARGIN + 3, CARD_MARGIN + 3, WIDTH - CARD_MARGIN - 3, CARD_MARGIN + 9),
+                           radius=3, fill=accent)
+    img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+    return img.crop((0, 0, WIDTH, need))
 
 
 def _measure_header(spec: dict, content_w: float) -> float:
@@ -505,7 +527,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
     if kind == "rows":
         items = blk.get("items") or []
         h = 18 + 44 * len(items) + 16
-        _panel(draw, (x, y, x + content_w, y + h))
+        _panel(draw, (x, y, x + content_w, y + h), fill=PANEL_SOFT)
         cy = y + 18
         for it in items:
             k = str(it.get("k") or "")
@@ -519,7 +541,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
     if kind == "bars":
         items = blk.get("items") or []
         h = 18 + 72 * len(items) + 16
-        _panel(draw, (x, y, x + content_w, y + h))
+        _panel(draw, (x, y, x + content_w, y + h), fill=PANEL_SOFT)
         cy = y + 18
         for it in items:
             label = str(it.get("label") or "")
@@ -532,7 +554,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
             draw_rich(draw, x + content_w - x_pad - nw, cy + 2, note, 23, INK, bold=True)
             bx0, by0 = x + x_pad, cy + 34
             bx1 = x + content_w - x_pad
-            draw.rounded_rectangle((bx0, by0, bx1, by0 + 16), radius=8, fill=PANEL_SOFT)
+            draw.rounded_rectangle((bx0, by0, bx1, by0 + 16), radius=8, fill=TRACK)
             ratio = max(0.0, min(1.0, cur / mx))
             if ratio > 0:
                 draw.rounded_rectangle((bx0, by0, bx0 + max(16, (bx1 - bx0) * ratio), by0 + 16), radius=8, fill=bar_color)
@@ -545,7 +567,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
             lay = _order_layout(order, inner_w)
             h = lay["h"]
             accent_o = color(order.get("accent"), accent)
-            _panel(draw, (x, cy, x + content_w, cy + h), fill=PANEL, outline=_mix(accent_o, LINE, 0.7))
+            _panel(draw, (x, cy, x + content_w, cy + h), fill=PANEL_SOFT, outline=_mix(accent_o, LINE, 0.7))
             badge = lay["badge"]
             if badge:
                 bw = width_of(badge, 24, True) + 26
@@ -602,7 +624,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
             if bar:
                 bx0 = x + 44
                 bx1 = x + content_w - 6
-                draw.rounded_rectangle((bx0, cy - 8, bx1, cy + 6), radius=7, fill=PANEL_SOFT)
+                draw.rounded_rectangle((bx0, cy - 8, bx1, cy + 6), radius=7, fill=TRACK)
                 ratio = max(0.0, min(1.0, float(bar.get("ratio") or 0)))
                 if ratio > 0:
                     draw.rounded_rectangle((bx0, cy - 8, bx0 + max(14, (bx1 - bx0) * ratio), cy + 6),
@@ -613,7 +635,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
     if kind == "rank":
         items = blk.get("items") or []
         h = 14 + 66 * len(items) + 12
-        _panel(draw, (x, y, x + content_w, y + h))
+        _panel(draw, (x, y, x + content_w, y + h), fill=PANEL_SOFT)
         cy = y + 14
         for it in items:
             pos = it.get("pos")
@@ -637,7 +659,7 @@ def _draw_block(draw, kind, blk, x, y, content_w, accent) -> float:
         head = blk.get("head") or []
         rows = blk.get("rows") or []
         h = 16 + 40 + 34 * len(rows) + 14
-        _panel(draw, (x, y, x + content_w, y + h))
+        _panel(draw, (x, y, x + content_w, y + h), fill=PANEL_SOFT)
         cols = len(head) or 1
         col_w = inner_w / cols
         cx = x + x_pad
